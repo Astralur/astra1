@@ -3,10 +3,11 @@ MusicBee -> OBS  (misma fuente de datos que usa MusicPresence)
 
 Lee lo que suena a través de los controles multimedia de Windows (SMTC),
 saca la carátula y sirve un overlay en http://localhost:PUERTO/ que se añade
-a OBS como "Fuente de navegador" (960x280). Incluye una waveform real
+a OBS como "Fuente de navegador" (640x180). Incluye una waveform real
 calculada con el audio del sistema (loopback).
-Diseño horizontal: información a la izquierda, carátula a la derecha,
-título y álbum con desplazamiento continuo de derecha a izquierda.
+Tarjeta horizontal compacta: carátula a la izquierda, título y artista
+a la derecha, barra de progreso debajo y tiempo transcurrido / duración total.
+El título y el álbum se desplazan de derecha a izquierda si no caben.
 
 Requisitos:
   - Windows 10/11
@@ -293,64 +294,82 @@ def _audio_worker():
 OVERLAY_HTML = r"""<!doctype html>
 <html lang="es"><head><meta charset="utf-8"><title>Now playing</title>
 <style>
-:root{--h:350;--accent:#d11a2a;--accent2:#ff6a4d;--bg:#17151c;--ink:#f7f4ef;--ink2:rgba(247,244,239,.72)}
+:root{--accent:#589daf;--accent2:#9cc7cf;--bg:#173344;--ink:#f7f4ef;--ink2:rgba(247,244,239,.65)}
 *{box-sizing:border-box;margin:0}
 html,body{width:100%;height:100%;background:transparent;overflow:hidden;font-family:system-ui,"Segoe UI",sans-serif}
-.card{position:absolute;inset:20px;border-radius:22px;overflow:hidden;padding:16px;
+.card{position:absolute;inset:12px;border-radius:20px;overflow:hidden;padding:13px;
   background:var(--bg);color:var(--ink);display:grid;
-  grid-template-columns:minmax(0,1fr) min(240px,calc(100vh - 74px),30vw);gap:28px;
-  border:1px solid rgba(255,255,255,.1);box-shadow:0 8px 20px rgba(0,0,0,.4);
+  grid-template-columns:min(160px,calc(100vh - 52px),26vw) minmax(0,1fr);gap:20px;
+  border:1px solid rgba(255,255,255,.14);box-shadow:0 5px 12px rgba(0,0,0,.22);
   opacity:0;transform:translateY(12px);transition:opacity .5s ease,transform .5s ease,background .8s ease}
 .card.on{opacity:1;transform:none}
+.backdrop{position:absolute;inset:-30px;background:center/cover no-repeat;
+  filter:blur(26px) saturate(.7);opacity:.3;pointer-events:none;transition:background-image .6s}
 .glow{position:absolute;inset:0;pointer-events:none;transition:background .8s ease;
-  background:radial-gradient(80% 160% at 100% 50%,color-mix(in srgb,var(--accent) 32%,transparent),transparent 75%)}
-.cover{position:relative;align-self:center;width:100%;aspect-ratio:1;border-radius:14px;
-  background:#2b2833 center/cover no-repeat;border:3px solid var(--accent);overflow:hidden;
-  box-shadow:0 8px 24px rgba(0,0,0,.3);transition:border-color .8s ease,opacity .4s}
+  background:linear-gradient(110deg,rgba(8,25,36,.28),rgba(8,25,36,.64))}
+.cover{position:relative;align-self:center;width:100%;aspect-ratio:1;border-radius:10px;
+  background:#243a46 center/cover no-repeat;overflow:hidden;
+  box-shadow:0 3px 10px rgba(0,0,0,.18);transition:opacity .4s}
 .cover::after{content:"";position:absolute;inset:0;box-shadow:inset 0 -40px 50px -30px rgba(0,0,0,.55)}
-.cover-empty{position:absolute;inset:0;display:grid;place-items:center;color:var(--ink2);font-size:64px}
+.cover-empty{position:absolute;inset:0;display:grid;place-items:center;color:var(--ink2);font-size:44px}
 .cover.has-cover .cover-empty{display:none}
-.body{position:relative;display:flex;flex-direction:column;min-width:0;min-height:0;padding:0 0 0 8px}
-.eyebrow{font-size:10px;font-weight:700;letter-spacing:.18em;color:var(--ink2);line-height:14px}
-.eyebrow::before{content:"";display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--accent2);margin-right:8px}
-.prog{display:flex;align-items:center;gap:10px;font-size:12px;color:var(--ink2);font-variant-numeric:tabular-nums}
-.bar{flex:1;height:4px;border-radius:2px;background:rgba(255,255,255,.16);overflow:hidden}
+.body{position:relative;align-self:center;display:flex;flex-direction:column;min-width:0;min-height:0;padding-right:18px}
+.playback-indicator{position:absolute;top:15px;right:16px;width:12px;height:14px;color:var(--ink2)}
+.playback-indicator::before,.playback-indicator::after{content:"";position:absolute;top:1px;width:4px;height:11px;border-radius:1px;background:currentColor}
+.playback-indicator::before{left:0}.playback-indicator::after{right:0}
+.card.paused .playback-indicator::before{width:0;height:0;top:0;border-top:7px solid transparent;
+  border-bottom:7px solid transparent;border-left:11px solid currentColor;border-radius:0;background:none}
+.card.paused .playback-indicator::after{display:none}
+.progress{margin-top:10px}
+.prog{display:flex;justify-content:space-between;gap:10px;margin-top:6px;font-size:11px;line-height:14px;
+  color:var(--ink2);font-variant-numeric:tabular-nums}
+.bar{height:3px;border-radius:3px;background:rgba(255,255,255,.17);overflow:hidden}
 .bar i{display:block;height:100%;width:0;border-radius:2px;
-  background:linear-gradient(90deg,var(--accent),var(--accent2));transition:background .8s}
-.title{margin-top:8px;font-size:30px;line-height:38px;font-weight:700;letter-spacing:-.025em}
-.artist{margin-top:3px;font-size:16px;line-height:21px;color:color-mix(in srgb,var(--accent2) 55%,#fff 30%);
+  background:var(--ink);transition:background .8s}
+.title{font-size:27px;line-height:33px;font-weight:600;letter-spacing:-.02em}
+.artist{font-size:16px;line-height:21px;color:var(--ink2);
   white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.album{margin-top:4px;font-size:13px;line-height:18px;color:var(--ink2)}
-.album.empty{visibility:hidden}
+.album{margin-top:2px;font-size:11px;line-height:15px;color:var(--ink2);opacity:.8}
+.album.empty{display:none}
 .marquee{overflow:hidden;white-space:nowrap;min-width:0;
-  mask-image:linear-gradient(90deg,transparent,#000 12px,#000 calc(100% - 22px),transparent)}
-.marquee-track{display:flex;width:max-content;animation:marquee var(--scroll-duration,20s) linear infinite;will-change:transform}
-.marquee-track span{flex:none;padding-right:48px}
+  mask-image:linear-gradient(90deg,#000,#000 calc(100% - 16px),transparent)}
+.marquee.fits{mask-image:none}
+.marquee-track{display:flex;width:max-content}
+.marquee.scrolling .marquee-track{animation:marquee var(--scroll-duration,20s) linear infinite;will-change:transform}
+.marquee-track span{flex:none;padding-right:40px}
+.marquee.fits .marquee-track span:first-child{padding-right:0}
+.marquee.fits .marquee-track span[aria-hidden]{display:none}
 @keyframes marquee{from{transform:translateX(0)}to{transform:translateX(calc(-1 * var(--scroll-distance,0px)))}}
-canvas{position:relative;flex:1;width:100%;height:0;min-height:28px;margin:8px 0}
-.card.paused .cover,.card.paused .body{opacity:.6}
+canvas{position:absolute;bottom:0;left:0;width:100%;height:44px;opacity:.12;pointer-events:none}
+.card.paused .cover,.card.paused .body{opacity:.7}
 .card.paused .marquee-track{animation-play-state:paused}
 .body{transition:opacity .4s}
 .swap{animation:swap .7s cubic-bezier(.2,.8,.2,1)}
 @keyframes swap{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
-@media(max-width:640px){.card{gap:16px}.body{padding-left:0}.title{font-size:24px;line-height:32px}}
+@media(max-width:420px){.card{gap:12px;padding:10px;border-radius:16px}
+  .body{padding-right:8px}.title{font-size:20px;line-height:25px}.artist{font-size:13px;line-height:18px}
+  .album{font-size:10px;line-height:13px}.progress{margin-top:7px}.prog{font-size:10px}}
 @media (prefers-reduced-motion:reduce){.swap{animation:none}.card{transition:none}
-  .marquee{mask-image:none}.marquee-track{animation:none;width:100%;will-change:auto}
+  .marquee{mask-image:none}.marquee.scrolling .marquee-track{animation:none;width:100%;will-change:auto}
   .marquee-track span:first-child{min-width:0!important;flex:1;overflow:hidden;text-overflow:ellipsis;padding-right:0}
   .marquee-track span[aria-hidden]{display:none}}
 </style></head>
 <body>
 <div class="card" id="card">
+  <div class="backdrop" id="backdrop"></div>
   <div class="glow"></div>
+  <canvas id="wave"></canvas>
+  <div class="cover" id="cover" role="img" aria-label="Portada del álbum"><span class="cover-empty" aria-hidden="true">♫</span></div>
   <div class="body" id="meta">
-    <div class="eyebrow" id="status">SONANDO</div>
     <div class="title marquee" id="title"><div class="marquee-track"><span></span><span aria-hidden="true"></span></div></div>
     <div class="artist" id="artist"></div>
     <div class="album marquee empty" id="album"><div class="marquee-track"><span></span><span aria-hidden="true"></span></div></div>
-    <canvas id="wave"></canvas>
-    <div class="prog"><span id="cur">0:00</span><div class="bar" id="bar"><i id="fill"></i></div><span id="tot"></span></div>
+    <div class="progress">
+      <div class="bar" id="bar"><i id="fill"></i></div>
+      <div class="prog"><span id="cur">0:00</span><span id="tot">—:—</span></div>
+    </div>
   </div>
-  <div class="cover" id="cover" role="img" aria-label="Portada del álbum"><span class="cover-empty" aria-hidden="true">♫</span></div>
+  <div class="playback-indicator" id="status" role="img" aria-label="Reproduciendo" title="Reproduciendo"></div>
 </div>
 <script>
 const $ = id => document.getElementById(id);
@@ -363,7 +382,11 @@ function swap(el){ el.classList.remove('swap'); void el.offsetWidth; el.classLis
 /* ---------- texto continuo de derecha a izquierda ---------- */
 function measureMarquee(el){
   const track = el.firstElementChild, first = track.firstElementChild;
-  for(const span of track.children) span.style.minWidth = `${el.clientWidth}px`;
+  for(const span of track.children) span.style.minWidth = '';
+  // Medir sin la máscara ni el espacio entre copias: un título corto queda fijo.
+  el.classList.add('fits'); el.classList.remove('scrolling');
+  const overflow = first.getBoundingClientRect().width > el.clientWidth && el.clientWidth > 0;
+  el.classList.toggle('fits', !overflow); el.classList.toggle('scrolling', overflow);
   const distance = first.getBoundingClientRect().width;
   track.style.setProperty('--scroll-distance', `${distance}px`);
   track.style.setProperty('--scroll-duration', `${Math.max(8, distance / (el.id === 'title' ? 36 : 28))}s`);
@@ -428,7 +451,8 @@ async function poll(){
     const show = s.active && !(s.hide_paused && !s.playing);
     $('card').classList.toggle('on', show);
     $('card').classList.toggle('paused', !s.playing);
-    $('status').textContent = s.playing ? 'SONANDO' : 'EN PAUSA';
+    const status = s.playing ? 'Reproduciendo' : 'En pausa';
+    $('status').setAttribute('aria-label', status); $('status').title = status;
     playing = s.playing;
     snap = {pos: s.position + s.age, dur: s.duration, playing: s.playing, t0: performance.now()};
     const key = JSON.stringify([s.title, s.artist, s.album]);
@@ -446,10 +470,12 @@ async function poll(){
       if (s.has_cover){
         const url = `/cover?v=${s.rev}`;
         $('cover').style.backgroundImage = `url(${url})`;
+        $('backdrop').style.backgroundImage = `url(${url})`;
         paletteFrom(url);
       } else {
         $('cover').style.backgroundImage = 'none';
-        setPalette(350, .75);
+        $('backdrop').style.backgroundImage = 'none';
+        setPalette(200, .55);
       }
     }
   }catch(e){ $('card').classList.remove('on'); }
@@ -460,7 +486,7 @@ setInterval(() => {
   let p = snap.playing ? snap.pos + (performance.now() - snap.t0) / 1000 : snap.pos;
   if (snap.dur > 0) p = Math.min(p, snap.dur);
   $('cur').textContent = fmt(p);
-  $('tot').textContent = snap.dur > 0 ? fmt(snap.dur) : '';
+  $('tot').textContent = snap.dur > 0 ? fmt(snap.dur) : '—:—';
   $('bar').style.visibility = snap.dur > 0 ? 'visible' : 'hidden';
   $('fill').style.width = snap.dur > 0 ? (p / snap.dur * 100) + '%' : '0%';
 }, 250);
@@ -649,8 +675,9 @@ def script_description():
     return (
         "<b>MusicBee → OBS</b><br>"
         "Overlay con carátula y waveform en <code>http://localhost:PUERTO/</code> "
-        "(añádelo como Fuente de navegador, 960×280). Diseño horizontal, carátula "
-        "a la derecha y título/álbum de derecha a izquierda. Lee los controles multimedia "
+        "(añádelo como Fuente de navegador, 640×180). Tarjeta compacta, carátula "
+        "a la izquierda, título/artista y barra de progreso con tiempo y duración. "
+        "Lee los controles multimedia "
         "de Windows, igual que MusicPresence."
     )
 

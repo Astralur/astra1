@@ -156,6 +156,14 @@ class AudioTests(unittest.TestCase):
         self.assertIsNone(tap.read(np))
         tap.close()
 
+    def test_musicbee_can_read_audio_even_when_source_is_muted(self):
+        api = self.fake_api()
+        tap = self.module._ObsAudioTap(api, 'MusicBee', capture_muted=True)
+        api.emit(1, self.tone * .05, muted=True)
+        np.testing.assert_array_equal(tap.read(np), self.tone * .05)
+        tap.close()
+        self.assertTrue(self.module._cfg['capture_muted'])
+
     def test_source_without_audio_and_missing_source_have_no_fallback(self):
         api = self.fake_api()
         api.flags[1] = 0
@@ -202,7 +210,7 @@ class AudioTests(unittest.TestCase):
         api.on_register = lambda source: api.emit(source, self.tone * .05)
         publications = []
 
-        def publish(bars, ready=False, source='', error=None):
+        def publish(bars, ready=False, source='', error=None, **extras):
             publications.append((list(bars), ready, source, error))
             if ready:
                 if source == 'MusicBee':

@@ -47,6 +47,7 @@ except Exception as e:
 POLL_SECONDS = 1.0
 MAX_COVER_TRIES = 6
 BANDS = 48
+WAVE_POINTS = 256
 
 _lock = threading.Lock()
 _stop = threading.Event()
@@ -66,6 +67,7 @@ _cfg = {
     "hide_paused": False,
     "visualizer": True,
     "audio_source": "",
+    "capture_muted": True,
 }
 
 _state = {
@@ -78,6 +80,9 @@ _state = {
 }
 _bars = [0.0] * BANDS
 _audio_ok = False
+_wave = [0.0] * WAVE_POINTS
+_level = 0.0
+_audio_stamp = 0.0
 _audio_error = None
 _audio_source_name = ""
 _last_applied = None
@@ -246,6 +251,8 @@ class _SpectrumProcessor:
         self.win = np.hanning(n).astype(np.float32)[:, None]
         self.buf = np.zeros((n, 2), dtype=np.float32)
         self.gain = None
+        self.wave = [0.0] * WAVE_POINTS
+        self.level = 0.0
         edges = np.geomspace(40, min(14000, rate * .49), BANDS + 1)
         freqs = np.fft.rfftfreq(n, 1.0 / rate)
         self.idx = [np.flatnonzero((freqs >= edges[i]) & (freqs < edges[i + 1])) for i in range(BANDS)]
@@ -255,10 +262,12 @@ class _SpectrumProcessor:
         self.tilt = np.linspace(0, .22, BANDS)
 
     def reset(self):
+        self.wave = [0.0] * WAVE_POINTS
+        self.level = 0.0
         self.buf.fill(0)
         self.gain = None
 
-    def process(self, data):
+    def process(self, data, normalize=True):
         np = self.np
         if not len(data):
             return [0.0] * BANDS
@@ -272,17 +281,31 @@ class _SpectrumProcessor:
             return [0.0] * BANDS
         peak = float(np.max(np.abs(data)))
         desired = min(100.0, .12 / rms, .98 / peak)
-        if self.gain is None:
+        if not normalize:
+            self.gain = 1.0
+        elif self.gain is None:
             self.gain = desired
         else:
             tau = .05 if desired < self.gain else .6
             self.gain += (desired - self.gain) * (1 - math.exp(-len(data) / self.rate / tau))
         # Limitar inmediatamente los picos, subir suavemente en pasajes más bajos.
-        self.gain = min(self.gain, .98 / peak)
+        if normalize:
+            self.gain = min(self.gain, .98 / peak)
         samples = data[-self.n:] * self.gain
         count = len(samples)
         self.buf[:-count] = self.buf[count:]
         self.buf[-count:] = samples
+        self.level = min(1.0, float(np.sqrt(np.mean(samples * samples))) * 4)
+        # Osciloscopio real: canal con más energía, ventana alineada al cruce por cero.
+        channel = int(np.argmax(np.mean(self.buf * self.buf, axis=0)))
+        signal = self.buf[:, channel]
+        length = min(768, self.n)
+        limit = self.n - length
+        crossings = np.flatnonzero((signal[:limit + 1] <= 0) & (signal[1:limit + 2] > 0))
+        start = int(crossings[-1]) if len(crossings) else limit
+        window = signal[start:start + length]
+        self.wave = np.clip(np.interp(np.linspace(0, length - 1, WAVE_POINTS),
+                                     np.arange(length), window), -1, 1).round(4).tolist()
         # Energía de ambos canales: una señal estéreo en contrafase no desaparece.
         fft = np.fft.rfft(self.buf * self.win, axis=0)
         mag = np.sqrt(np.mean(np.abs(fft) ** 2, axis=1)) / (self.n / 4)
@@ -348,8 +371,9 @@ class _ObsAudioApi:
 
 class _ObsAudioTap:
     """Retener una fuente, copiar sus muestras y retirar el callback antes de liberarla."""
-    def __init__(self, api, name):
+    def __init__(self, api, name, capture_muted=False):
         self.api, self.requested = api, name
+        self.capture_muted = capture_muted
         self.source = None
         self.active = False
         self.registered = False
@@ -382,7 +406,7 @@ class _ObsAudioTap:
             frames = data.frames
             if not 0 < frames <= self.rate * 2:
                 return
-            planes = None if muted else tuple(
+            planes = None if muted and not self.capture_muted else tuple(
                 ctypes.string_at(data.data[c], frames * 4) if data.data[c] else bytes(frames * 4)
                 for c in range(self.channels))
             try:
@@ -421,10 +445,12 @@ class _ObsAudioTap:
             self.source = None
 
 
-def _publish_audio(bars, ready=False, source='', error=None):
-    global _bars, _audio_ok, _audio_source_name, _audio_error
+def _publish_audio(bars, ready=False, source='', error=None, wave=None, level=0.0):
+    global _bars, _audio_ok, _audio_source_name, _audio_error, _wave, _level, _audio_stamp
     with _lock:
         _bars, _audio_ok, _audio_source_name, _audio_error = bars, ready, source, error
+        _wave = list(wave) if wave is not None else [0.0] * WAVE_POINTS
+        _level, _audio_stamp = level, time.monotonic()
 
 
 def _audio_worker():
@@ -445,7 +471,7 @@ def _audio_worker():
         while not _stop.is_set():
             try:
                 with _lock:
-                    enabled, requested = _cfg['visualizer'], _cfg['audio_source']
+                    enabled, requested, capture_muted = _cfg['visualizer'], _cfg['audio_source'], _cfg['capture_muted']
                 if not enabled or not requested:
                     if tap:
                         tap.close()
@@ -453,11 +479,11 @@ def _audio_worker():
                     _publish_audio(zero, error=None if not enabled else 'Selecciona una fuente de audio de OBS para las ondas.')
                     _stop.wait(.1)
                     continue
-                if tap and tap.requested != requested:
+                if tap and (tap.requested != requested or tap.capture_muted != capture_muted):
                     tap.close()
                     tap = None
                 if tap is None:
-                    tap = _ObsAudioTap(api, requested)
+                    tap = _ObsAudioTap(api, requested, capture_muted=capture_muted)
                     processor = _SpectrumProcessor(np, rate=tap.rate)
                     last_packet = inspected = time.monotonic()
                     _publish_audio(zero, source=requested)
@@ -484,7 +510,7 @@ def _audio_worker():
                     bars = zero
                 else:
                     bars = processor.process(data)
-                _publish_audio(bars, True, requested)
+                _publish_audio(bars, True, requested, wave=processor.wave, level=processor.level)
                 last_packet = time.monotonic()
                 last_error = None
             except Exception as e:
@@ -816,6 +842,8 @@ class _Handler(BaseHTTPRequestHandler):
                     payload = {
                         "bars": list(_bars), "real": bool(_audio_ok and _cfg["visualizer"]),
                         "enabled": _cfg["visualizer"], "source": _audio_source_name,
+                        "wave": list(_wave), "level": _level,
+                        "age": max(0.0, time.monotonic() - _audio_stamp),
                         "error": _audio_error,
                     }
                 self._send(200, "application/json", json.dumps(payload).encode("utf-8"))
@@ -930,6 +958,7 @@ def script_properties():
     obs.obs_properties_add_int(props, "port", "Puerto del overlay", 1024, 65535, 1)
     obs.obs_properties_add_bool(props, "hide_paused", "Ocultar overlay en pausa")
     obs.obs_properties_add_bool(props, "visualizer", "Ondas de MusicBee (nivel normalizado)")
+    obs.obs_properties_add_bool(props, "capture_muted", "Capturar aunque la fuente esté silenciada en OBS")
     audio = obs.obs_properties_add_list(
         props, "audio_source", "Fuente de audio OBS para las ondas",
         obs.OBS_COMBO_TYPE_LIST, obs.OBS_COMBO_FORMAT_STRING,

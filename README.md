@@ -28,8 +28,11 @@ del escritorio automáticamente ni cambia la salida o monitorización de MusicBe
    **640 × 180**. El puerto se puede cambiar en las propiedades del script.
 
 El selector ofrece las fuentes con salida de audio de OBS. La fuente debe estar
-activa y suministrar audio. Si está silenciada, deja de suministrar muestras,
-se elimina o desactivas las ondas, el visualizador vuelve al reposo. Si falla
+activa y suministrar audio. La opción **Capturar aunque la fuente esté silenciada
+en OBS** está activada por defecto: silenciarla en el mezclador no detiene las
+ondas. Si desactivas esa opción, se respeta el silencio del mezclador. Si la fuente
+deja de suministrar muestras, se elimina o desactivas las ondas, el visualizador
+vuelve al reposo. Si falla
 la captura, el script registra el error en OBS y no utiliza una animación falsa
 ni busca otra fuente por defecto.
 
@@ -57,3 +60,10 @@ Las pruebas verifican la normalización con señales sintéticas, la copia de
 muestras planares, la suscripción exclusiva a la fuente seleccionada, el silencio
 y la liberación del callback con una API de OBS simulada. La integración real
 requiere ejecutar el script dentro de OBS en Windows 10/11.
+
+## Más estilos
+
+El script separado [obs_visualizers.py](obs_visualizers.py) ofrece ocho estilos y
+una galería para compararlos. Por defecto comparte este mismo audio de MusicBee,
+incluyendo la captura con la fuente silenciada. Consulta
+[las instrucciones de visualizadores](VISUALIZERS.md).

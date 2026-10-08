@@ -4,7 +4,9 @@ MusicBee -> OBS  (misma fuente de datos que usa MusicPresence)
 Lee lo que suena a través de los controles multimedia de Windows (SMTC),
 saca la carátula y sirve un overlay en http://localhost:PUERTO/ que se añade
 a OBS como "Fuente de navegador" (640x180). Incluye una waveform real
-calculada con el audio del sistema (loopback).
+calculada directamente con el audio de la fuente que elijas en OBS.
+Normaliza automáticamente el nivel de entrada del visualizador, sin cambiar
+el volumen de reproducción ni capturar las demás aplicaciones.
 Tarjeta horizontal compacta: carátula a la izquierda, título y artista
 a la derecha, barra de progreso debajo y tiempo transcurrido / duración total.
 El título y el álbum se desplazan de derecha a izquierda si no caben.
@@ -13,12 +15,17 @@ Requisitos:
   - Windows 10/11
   - Python 3.12 o inferior configurado en OBS
   - pip install winsdk
-  - (waveform real) pip install soundcard numpy
+  - (waveform real) pip install numpy
+  - Seleccionar en el script una fuente de audio de OBS que capture MusicBee.
+    No requiere cambiar la salida de MusicBee ni utilizar VB-CABLE.
 """
 
 import asyncio
+import ctypes
 import json
+import math
 import os
+import queue
 import threading
 import time
 from datetime import datetime
@@ -58,6 +65,7 @@ _cfg = {
     "port": 8765,
     "hide_paused": False,
     "visualizer": True,
+    "audio_source": "",
 }
 
 _state = {
@@ -70,6 +78,8 @@ _state = {
 }
 _bars = [0.0] * BANDS
 _audio_ok = False
+_audio_error = None
+_audio_source_name = ""
 _last_applied = None
 _last_error = None
 
@@ -227,66 +237,271 @@ def _worker():
     loop.close()
 
 
-# ------------------------------------------------- audio / espectro (FFT) ---
+# -------------------------------------- fuente de audio OBS / espectro (FFT) ---
+
+class _SpectrumProcessor:
+    """AGC RMS solo para las ondas: nivel objetivo, límite de ganancia y puerta de silencio."""
+    def __init__(self, np, rate=44100, n=2048):
+        self.np, self.rate, self.n = np, rate, n
+        self.win = np.hanning(n).astype(np.float32)[:, None]
+        self.buf = np.zeros((n, 2), dtype=np.float32)
+        self.gain = None
+        edges = np.geomspace(40, min(14000, rate * .49), BANDS + 1)
+        freqs = np.fft.rfftfreq(n, 1.0 / rate)
+        self.idx = [np.flatnonzero((freqs >= edges[i]) & (freqs < edges[i + 1])) for i in range(BANDS)]
+        for i, bins in enumerate(self.idx):
+            if not len(bins):
+                self.idx[i] = np.array([int(np.argmin(np.abs(freqs - edges[i])))])
+        self.tilt = np.linspace(0, .22, BANDS)
+
+    def reset(self):
+        self.buf.fill(0)
+        self.gain = None
+
+    def process(self, data):
+        np = self.np
+        if not len(data):
+            return [0.0] * BANDS
+        data = np.nan_to_num(np.asarray(data, dtype=np.float32), nan=0, posinf=0, neginf=0)
+        if self.buf.shape[1] != data.shape[1]:
+            self.buf = np.zeros((self.n, data.shape[1]), dtype=np.float32)
+            self.gain = None
+        rms = float(np.sqrt(np.mean(data * data)))
+        if rms <= .0001:  # ~-80 dBFS: no convertir ruido o silencio en ondas.
+            self.reset()
+            return [0.0] * BANDS
+        peak = float(np.max(np.abs(data)))
+        desired = min(100.0, .12 / rms, .98 / peak)
+        if self.gain is None:
+            self.gain = desired
+        else:
+            tau = .05 if desired < self.gain else .6
+            self.gain += (desired - self.gain) * (1 - math.exp(-len(data) / self.rate / tau))
+        # Limitar inmediatamente los picos, subir suavemente en pasajes más bajos.
+        self.gain = min(self.gain, .98 / peak)
+        samples = data[-self.n:] * self.gain
+        count = len(samples)
+        self.buf[:-count] = self.buf[count:]
+        self.buf[-count:] = samples
+        # Energía de ambos canales: una señal estéreo en contrafase no desaparece.
+        fft = np.fft.rfft(self.buf * self.win, axis=0)
+        mag = np.sqrt(np.mean(np.abs(fft) ** 2, axis=1)) / (self.n / 4)
+        out = []
+        for i, bins in enumerate(self.idx):
+            db = 20 * np.log10(float(mag[bins].max()) + 1e-9)
+            out.append(round(min(1.0, max(0.0, (db + 72) / 52 + self.tilt[i])), 3))
+        return out
+
+
+# Contrato de libobs: obs.h (obs_source_audio_capture_t) y media-io/audio-io.h.
+# El callback recibe float32 planar al sample rate de OBS, después de los filtros.
+class _ObsAudioData(ctypes.Structure):
+    _fields_ = [('data', ctypes.c_void_p * 8), ('frames', ctypes.c_uint32),
+                ('timestamp', ctypes.c_uint64)]
+
+
+class _ObsAudioInfo(ctypes.Structure):
+    _fields_ = [('samples_per_sec', ctypes.c_uint32), ('speakers', ctypes.c_int32)]
+
+
+_AUDIO_CALLBACK = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_void_p,
+                                  ctypes.POINTER(_ObsAudioData), ctypes.c_bool)
+
+
+class _ObsAudioApi:
+    def __init__(self):
+        if os.name != 'nt':
+            raise RuntimeError('La captura de fuentes debe ejecutarse dentro de OBS en Windows.')
+        kernel = ctypes.WinDLL('kernel32')
+        kernel.GetModuleHandleW.argtypes = [ctypes.c_wchar_p]
+        kernel.GetModuleHandleW.restype = ctypes.c_void_p
+        handle = kernel.GetModuleHandleW('obs.dll') or kernel.GetModuleHandleW('libobs.dll')
+        if not handle:
+            raise RuntimeError('No se encuentra la biblioteca de OBS ya cargada.')
+        # CDLL libera el GIL durante RemoveCallback: evita bloquear el hilo de audio
+        # cuando otro callback necesita entrar en Python. Nunca cargar otra copia de OBS.
+        self.lib = ctypes.CDLL('obs.dll', handle=handle)
+        signatures = {
+            'obs_get_source_by_name': (ctypes.c_void_p, [ctypes.c_char_p]),
+            'obs_source_release': (None, [ctypes.c_void_p]),
+            'obs_source_removed': (ctypes.c_bool, [ctypes.c_void_p]),
+            'obs_source_get_output_flags': (ctypes.c_uint32, [ctypes.c_void_p]),
+            'obs_source_get_name': (ctypes.c_char_p, [ctypes.c_void_p]),
+            'obs_get_audio_info': (ctypes.c_bool, [ctypes.POINTER(_ObsAudioInfo)]),
+            'obs_source_add_audio_capture_callback': (None, [ctypes.c_void_p, _AUDIO_CALLBACK, ctypes.c_void_p]),
+            'obs_source_remove_audio_capture_callback': (None, [ctypes.c_void_p, _AUDIO_CALLBACK, ctypes.c_void_p]),
+        }
+        for name, (restype, argtypes) in signatures.items():
+            fn = getattr(self.lib, name)
+            fn.restype, fn.argtypes = restype, argtypes
+            setattr(self, name, fn)
+
+    def audio_info(self):
+        info = _ObsAudioInfo()
+        if not self.obs_get_audio_info(ctypes.byref(info)):
+            raise RuntimeError('OBS todavía no tiene el audio inicializado.')
+        channels = info.speakers or 2
+        if not 8000 <= info.samples_per_sec <= 192000 or not 1 <= channels <= 8:
+            raise RuntimeError('Formato de audio de OBS no compatible.')
+        return info.samples_per_sec, channels
+
+
+class _ObsAudioTap:
+    """Retener una fuente, copiar sus muestras y retirar el callback antes de liberarla."""
+    def __init__(self, api, name):
+        self.api, self.requested = api, name
+        self.source = None
+        self.active = False
+        self.registered = False
+        self.error = None
+        self.packets = queue.Queue(maxsize=4)
+        self.callback = _AUDIO_CALLBACK(self._capture)
+        self.rate, self.channels = api.audio_info()
+        try:
+            self.source = api.obs_get_source_by_name(name.encode('utf-8'))
+            if not self.source:
+                raise RuntimeError(f'No se encuentra la fuente de OBS "{name}".')
+            if api.obs_source_removed(self.source):
+                raise RuntimeError(f'La fuente "{name}" se ha eliminado de OBS.')
+            if not api.obs_source_get_output_flags(self.source) & 2:  # OBS_SOURCE_AUDIO
+                raise RuntimeError(f'La fuente "{name}" no tiene salida de audio.')
+            self.active = True
+            api.obs_source_add_audio_capture_callback(self.source, self.callback, None)
+            self.registered = True
+        except Exception:
+            self.close()
+            raise
+
+    def _capture(self, _, source, audio, muted):
+        # No ejecutar FFT ni llamar a OBS desde su hilo de audio. Copiar antes
+        # de que OBS reutilice los buffers; la cola descarta audio antiguo.
+        if not self.active or source != self.source or not audio:
+            return
+        try:
+            data = audio.contents
+            frames = data.frames
+            if not 0 < frames <= self.rate * 2:
+                return
+            planes = None if muted else tuple(
+                ctypes.string_at(data.data[c], frames * 4) if data.data[c] else bytes(frames * 4)
+                for c in range(self.channels))
+            try:
+                self.packets.put_nowait(planes)
+            except queue.Full:
+                try:
+                    self.packets.get_nowait()
+                except queue.Empty:
+                    pass
+                try:
+                    self.packets.put_nowait(planes)
+                except queue.Full:
+                    pass
+        except Exception as e:
+            self.error = str(e)
+
+    def read(self, np):
+        planes = self.packets.get(timeout=.05)
+        # Usar el paquete más reciente para mantener baja la latencia.
+        while True:
+            try:
+                planes = self.packets.get_nowait()
+            except queue.Empty:
+                break
+        if planes is None:
+            return None  # Fuente silenciada.
+        return np.column_stack([np.frombuffer(p, dtype=np.float32) for p in planes])
+
+    def close(self):
+        self.active = False
+        if self.registered:
+            self.api.obs_source_remove_audio_capture_callback(self.source, self.callback, None)
+            self.registered = False
+        if self.source:
+            self.api.obs_source_release(self.source)
+            self.source = None
+
+
+def _publish_audio(bars, ready=False, source='', error=None):
+    global _bars, _audio_ok, _audio_source_name, _audio_error
+    with _lock:
+        _bars, _audio_ok, _audio_source_name, _audio_error = bars, ready, source, error
+
 
 def _audio_worker():
-    """Captura el audio del sistema (loopback) y calcula BANDS bandas."""
-    global _bars, _audio_ok
+    """Analizar exclusivamente una fuente de OBS; no tocar dispositivos ni monitorización."""
+    zero, tap = [0.0] * BANDS, None
     try:
         import numpy as np
-        import soundcard as sc
+        api = _ObsAudioApi()
     except Exception as e:
-        obs.script_log(obs.LOG_INFO,
-                       f"MusicBee NowPlaying: sin waveform real ({e}). "
-                       "Instala 'soundcard' y 'numpy' o se usará una animación simulada.")
+        message = f'{e}. Ejecuta el script dentro de OBS con numpy instalado.'
+        _publish_audio(zero, error=message)
+        obs.script_log(obs.LOG_WARNING, f'MusicBee NowPlaying: {message}')
         return
 
-    rate, n = 44100, 2048
-    win = np.hanning(n)
-    edges = np.geomspace(40, 14000, BANDS + 1)
-    freqs = np.fft.rfftfreq(n, 1.0 / rate)
-    idx = [np.where((freqs >= edges[i]) & (freqs < edges[i + 1]))[0] for i in range(BANDS)]
-    # las bandas muy graves pueden quedarse sin bins: usar el más cercano
-    for i in range(BANDS):
-        if len(idx[i]) == 0:
-            idx[i] = np.array([int(np.argmin(np.abs(freqs - edges[i])))])
-    tilt = np.linspace(0.0, 0.22, BANDS)  # compensa que los agudos tienen menos energía
-    buf = np.zeros(n, dtype=np.float32)
-
-    while not _stop.is_set():
-        try:
-            with _lock:
-                enabled = _cfg["visualizer"]
-            if not enabled:
-                _audio_ok = False
-                _stop.wait(0.5)
-                continue
-            spk = sc.default_speaker()
-            mic = sc.get_microphone(id=str(spk.name), include_loopback=True)
-            with mic.recorder(samplerate=rate, channels=2, blocksize=1024) as rec:
-                _audio_ok = True
-                while not _stop.is_set():
-                    with _lock:
-                        if not _cfg["visualizer"]:
-                            break
-                    data = rec.record(numframes=1024)
-                    mono = data.mean(axis=1).astype(np.float32)
-                    buf = np.concatenate((buf[len(mono):], mono))
-                    mag = np.abs(np.fft.rfft(buf * win)) / (n / 4)
-                    out = []
-                    for i in range(BANDS):
-                        m = float(mag[idx[i]].max())
-                        db = 20.0 * np.log10(m + 1e-9)
-                        v = (db + 72.0) / 52.0 + tilt[i]
-                        out.append(round(min(1.0, max(0.0, v)), 3))
-                    with _lock:
-                        _bars = out
-        except Exception:
-            _audio_ok = False
-            with _lock:
-                _bars = [0.0] * BANDS
-            _stop.wait(2.0)
-    _audio_ok = False
+    processor = None
+    last_packet, inspected, last_error = 0.0, 0.0, None
+    try:
+        while not _stop.is_set():
+            try:
+                with _lock:
+                    enabled, requested = _cfg['visualizer'], _cfg['audio_source']
+                if not enabled or not requested:
+                    if tap:
+                        tap.close()
+                        tap = None
+                    _publish_audio(zero, error=None if not enabled else 'Selecciona una fuente de audio de OBS para las ondas.')
+                    _stop.wait(.1)
+                    continue
+                if tap and tap.requested != requested:
+                    tap.close()
+                    tap = None
+                if tap is None:
+                    tap = _ObsAudioTap(api, requested)
+                    processor = _SpectrumProcessor(np, rate=tap.rate)
+                    last_packet = inspected = time.monotonic()
+                    _publish_audio(zero, source=requested)
+                now = time.monotonic()
+                if now - inspected >= .5:
+                    if api.obs_source_removed(tap.source):
+                        raise RuntimeError(f'La fuente "{requested}" se ha eliminado de OBS.')
+                    if api.audio_info() != (tap.rate, tap.channels):
+                        tap.close()
+                        tap = None
+                        continue
+                    inspected = now
+                if tap.error:
+                    raise RuntimeError(tap.error)
+                try:
+                    data = tap.read(np)
+                except queue.Empty:
+                    if now - last_packet >= .2:
+                        processor.reset()
+                        _publish_audio(zero, source=requested)
+                    continue
+                if data is None:
+                    processor.reset()
+                    bars = zero
+                else:
+                    bars = processor.process(data)
+                _publish_audio(bars, True, requested)
+                last_packet = time.monotonic()
+                last_error = None
+            except Exception as e:
+                if tap:
+                    tap.close()
+                    tap = None
+                _publish_audio(zero, error=str(e))
+                if str(e) != last_error:
+                    obs.script_log(obs.LOG_WARNING, f'MusicBee NowPlaying (fuente OBS): {e}')
+                    last_error = str(e)
+                _stop.wait(1)
+    finally:
+        if tap:
+            tap.close()
+        with _lock:
+            error = _audio_error
+        _publish_audio(zero, error=error)
 
 
 # ------------------------------------------------------------- servidor web ---
@@ -498,20 +713,11 @@ async function pollBars(){
   if (busy) return; busy = true;
   try{
     const s = await (await fetch('/spectrum.json', {cache: 'no-store'})).json();
-    target = s.bars; real = s.real;
-  }catch(e){} finally { busy = false; }
+    real = s.real && s.enabled;
+    target = real ? s.bars : new Array(N).fill(0);
+  }catch(e){ real = false; target = new Array(N).fill(0); } finally { busy = false; }
 }
 setInterval(pollBars, 33);
-
-function simulate(t){           // animacion de reserva si no hay audio real
-  const out = [];
-  for (let i=0;i<N;i++){
-    const f = i/N;
-    const v = .5 + .5*Math.sin(t*1.7 + i*.55) * Math.sin(t*.9 + i*.21);
-    out.push(playing ? Math.max(0, (1-f*.75) * (.25 + .55*v) * (.8 + .2*Math.sin(t*3.1))) : 0);
-  }
-  return out;
-}
 
 const cv = $('wave'), g = cv.getContext('2d');
 let W = 0, H = 0;
@@ -525,7 +731,7 @@ let last = performance.now();
 function frame(now){
   const dt = Math.min(.05, (now-last)/1000); last = now;
   if (!W){ resize(); }
-  const src = real ? target : simulate(now/1000);
+  const src = real && playing ? target : new Array(N).fill(0);
   for (let i=0;i<N;i++){
     const t = src[i] || 0;
     const k = t > cur[i] ? 1-Math.exp(-dt*22) : 1-Math.exp(-dt*5.5);   // sube rapido, cae suave
@@ -607,7 +813,11 @@ class _Handler(BaseHTTPRequestHandler):
                 self._send(200, "application/json", json.dumps(payload).encode("utf-8"))
             elif path == "/spectrum.json":
                 with _lock:
-                    payload = {"bars": list(_bars), "real": bool(_audio_ok and _cfg["visualizer"])}
+                    payload = {
+                        "bars": list(_bars), "real": bool(_audio_ok and _cfg["visualizer"]),
+                        "enabled": _cfg["visualizer"], "source": _audio_source_name,
+                        "error": _audio_error,
+                    }
                 self._send(200, "application/json", json.dumps(payload).encode("utf-8"))
             elif path == "/cover":
                 with _lock:
@@ -678,7 +888,10 @@ def script_description():
         "(añádelo como Fuente de navegador, 640×180). Tarjeta compacta, carátula "
         "a la izquierda, título/artista y barra de progreso con tiempo y duración. "
         "Lee los controles multimedia "
-        "de Windows, igual que MusicPresence."
+        "de Windows, igual que MusicPresence. Audio de la fuente de OBS que elijas con "
+        "normalización automática para las ondas (sin cambiar el volumen audible). "
+        "Compatible con Windows 10/11. Selecciona una fuente de audio de OBS "
+        "en las propiedades. Instala numpy en el Python de OBS."
     )
 
 
@@ -692,12 +905,37 @@ def script_defaults(settings):
             obs.obs_data_set_default_string(settings, key, value)
 
 
+def _fill_audio_sources(prop):
+    obs.obs_property_list_clear(prop)
+    obs.obs_property_list_add_string(prop, "(selecciona una fuente de audio)", "")
+    sources = obs.obs_enum_sources()
+    if sources:
+        try:
+            for source in sources:
+                if obs.obs_source_get_output_flags(source) & obs.OBS_SOURCE_AUDIO:
+                    name = obs.obs_source_get_name(source)
+                    obs.obs_property_list_add_string(prop, name, name)
+        finally:
+            obs.source_list_release(sources)
+
+
+def _refresh_audio_sources(props, prop):
+    _fill_audio_sources(obs.obs_properties_get(props, "audio_source"))
+    return True
+
+
 def script_properties():
     props = obs.obs_properties_create()
 
     obs.obs_properties_add_int(props, "port", "Puerto del overlay", 1024, 65535, 1)
     obs.obs_properties_add_bool(props, "hide_paused", "Ocultar overlay en pausa")
-    obs.obs_properties_add_bool(props, "visualizer", "Visualizador de audio (waveform real)")
+    obs.obs_properties_add_bool(props, "visualizer", "Ondas de MusicBee (nivel normalizado)")
+    audio = obs.obs_properties_add_list(
+        props, "audio_source", "Fuente de audio OBS para las ondas",
+        obs.OBS_COMBO_TYPE_LIST, obs.OBS_COMBO_FORMAT_STRING,
+    )
+    _fill_audio_sources(audio)
+    obs.obs_properties_add_button(props, "refresh_audio_sources", "Actualizar fuentes de audio", _refresh_audio_sources)
 
     lst = obs.obs_properties_add_list(
         props, "source", "Fuente de texto (opcional)",

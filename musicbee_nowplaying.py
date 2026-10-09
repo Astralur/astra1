@@ -26,6 +26,7 @@ import json
 import math
 import os
 import queue
+import re
 import threading
 import time
 from datetime import datetime
@@ -83,6 +84,17 @@ _state = {
     "elapsed": 0.0, "tick": 0.0,
     "text": "", "error": None,
 }
+_palette_revision = None
+_palette_colors = None
+
+
+def _valid_palette(colors):
+    return (isinstance(colors, dict) and all(
+        isinstance(colors.get(key), str) and len(colors[key]) <= 128
+        and re.fullmatch(r'(?:#[0-9a-fA-F]{3,8}|(?:hsl|hsla|rgb|rgba)\([0-9.,%+\- /]+\))', colors[key])
+        for key in ('color_a', 'color_b', 'background_color')))
+
+
 _bars = [0.0] * BANDS
 _audio_ok = False
 _wave = [0.0] * WAVE_POINTS
@@ -645,6 +657,7 @@ canvas{position:absolute;bottom:0;left:0;width:100%;height:44px;opacity:.12;poin
 const $ = id => document.getElementById(id);
 const N = 128;
 let rev = -1, lastKey = null, playing = false;
+let paletteRev = -1;
 let snap = {pos: 0, dur: 0, playing: false, t0: performance.now()};
 
 function swap(el){ el.classList.remove('swap'); void el.offsetWidth; el.classList.add('swap'); }
@@ -692,7 +705,16 @@ function setPalette(h,s){
   root.setProperty('--accent',  `hsl(${h} ${s*100}% 46%)`);
   root.setProperty('--accent2', `hsl(${(h+38)%360} ${Math.min(100,s*100+10)}% 62%)`);
   root.setProperty('--bg',      `hsl(${h} 32% 9%)`);
+  paletteRev = rev;
+  sharePalette();
 }
+async function sharePalette(){
+  if(rev<0||paletteRev!==rev)return;
+  const root=document.documentElement.style;
+  const colors={color_a:root.getPropertyValue('--accent'),color_b:root.getPropertyValue('--accent2'),background_color:root.getPropertyValue('--bg')};
+  try{await fetch('/palette',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({rev,colors})});}catch(e){}
+}
+setInterval(sharePalette,5000);
 function paletteFrom(url){
   const expectedRev = rev;
   const img = new Image();
@@ -902,6 +924,46 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def do_POST(self):
+        global _palette_revision, _palette_colors
+        def reply(code, message):
+            self._send(code, 'application/json', json.dumps(message).encode('utf-8'))
+        if urlsplit(self.path).path != '/palette':
+            reply(404, {'error': 'No encontrado.'})
+            return
+        if self.headers.get_content_type() != 'application/json':
+            reply(415, {'error': 'Se requiere JSON.'})
+            return
+        origin = self.headers.get('Origin')
+        if origin:
+            try:
+                parsed = urlsplit(origin)
+                allowed = (parsed.scheme == 'http' and parsed.hostname in ('localhost', '127.0.0.1', '::1')
+                           and parsed.port == self.server.server_port)
+            except ValueError:
+                allowed = False
+            if not allowed:
+                reply(403, {'error': 'Origen no permitido.'})
+                return
+        try:
+            length = int(self.headers.get('Content-Length', '0'))
+            if not 0 < length <= 1024:
+                raise ValueError('Petición no válida.')
+            data = json.loads(self.rfile.read(length))
+            if (not isinstance(data, dict) or type(data.get('rev')) is not int
+                    or not _valid_palette(data.get('colors'))):
+                raise ValueError('Paleta no válida.')
+            with _lock:
+                stale = data['rev'] != _state['rev']
+                if not stale:
+                    _palette_revision = data['rev']
+                    _palette_colors = {key: data['colors'][key] for key in ('color_a', 'color_b', 'background_color')}
+            reply(409 if stale else 200, {'error': 'La portada ha cambiado.'} if stale else {'ok': True})
+        except (ValueError, TypeError):
+            reply(400, {'error': 'Paleta no válida.'})
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
     def do_GET(self):
         path = self.path.split("?")[0]
         try:
@@ -922,6 +984,11 @@ class _Handler(BaseHTTPRequestHandler):
                         "hide_paused": _cfg["hide_paused"],
                     }
                 self._send(200, "application/json", json.dumps(payload).encode("utf-8"))
+            elif path == '/theme.json':
+                with _lock:
+                    payload = {'rev': _state['rev'], 'has_cover': _state['cover'] is not None,
+                               'colors': _palette_colors if _palette_revision == _state['rev'] else None}
+                self._send(200, 'application/json', json.dumps(payload).encode('utf-8'))
             elif path == "/spectrum.json":
                 payload = _audio_snapshot()
                 self._send(200, "application/json", json.dumps(payload).encode("utf-8"))

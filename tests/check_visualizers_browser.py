@@ -43,6 +43,7 @@ try:
     with sync_playwright() as p:
         browser = p.chromium.launch(executable_path=os.environ.get('CHROMIUM_PATH'), args=['--no-sandbox'])
         page = browser.new_page(viewport={'width':1280,'height':900})
+        page.add_init_script('Image.prototype.decode=undefined;')
         errors = []
         page.on('pageerror', lambda e: errors.append(str(e)))
         page.goto(base + '/compare')
@@ -59,6 +60,7 @@ try:
         assert page.locator('.preset:visible').count() == 3
         page.locator('#filters button').filter(has_text='Todos').click()
         overlay=browser.new_page(viewport={'width':900,'height':300})
+        overlay.add_init_script('Image.prototype.decode=undefined;')
         overlay.on('pageerror',lambda e:errors.append(str(e)))
         overlay.goto(base)
         overlay.wait_for_function('packet.ready && main.level>.1')
@@ -77,21 +79,34 @@ try:
             return base64.b64decode(fixtures[color])
         with musicbee._lock:
             musicbee._state.update(active=True,playing=True,title='Color fixture',artist='MusicBee',album='Colors',cover=cover('#ff0000'),mime='image/png',rev=1)
+        page.locator('#link-colors').check()
+        overlay.wait_for_function("config.link_colors && effectiveConfig().color_a.startsWith('hsl(5 ')")
+        page.wait_for_function("document.getElementById('theme-status').textContent.includes('paleta de la portada')")
         music_page=browser.new_page(viewport={'width':640,'height':180})
         music_page.on('pageerror',lambda e:errors.append(str(e)))
         music_page.goto(f'http://127.0.0.1:{old_server.server_port}/')
         music_page.wait_for_function("document.documentElement.style.getPropertyValue('--accent').startsWith('hsl(5 ')")
-        page.locator('#link-colors').check()
-        overlay.wait_for_function("config.link_colors && effectiveConfig().color_a.startsWith('hsl(5 ')")
+        page.wait_for_function("document.getElementById('theme-status').textContent.includes('paleta del overlay')")
+        # La paleta publicada funciona aunque el visualizador no pueda descargar la portada.
+        overlay.route('**/musicbee-cover?*', lambda route:route.abort())
+        page.route('**/musicbee-cover?*', lambda route:route.abort())
         expected=music_page.evaluate("['--accent','--accent2','--bg'].map(key=>document.documentElement.style.getPropertyValue(key))")
         assert overlay.evaluate('[effectiveConfig().color_a,effectiveConfig().color_b,effectiveConfig().background_color]')==expected
+        music_page.evaluate('setPalette(220,.8)')
+        overlay.wait_for_function("effectiveConfig().color_a.startsWith('hsl(220 ')")
         with musicbee._lock:
             musicbee._state.update(cover=cover('#00ff00'),rev=2)
         music_page.wait_for_function("document.documentElement.style.getPropertyValue('--accent').startsWith('hsl(125 ')")
         overlay.wait_for_function("effectiveConfig().color_a.startsWith('hsl(125 ')")
         assert visualizers._cfg['color_a']==0xFFFFE156
+        page.route('**/musicbee-theme.json', lambda route:route.fulfill(status=503,content_type='application/json',body='{"error":"Overlay de prueba no disponible"}'))
+        page.wait_for_function("document.getElementById('theme-status').textContent.includes('Error de colores') && effectiveConfig().color_a==='#56e1ff'")
+        assert f'localhost:{old_server.server_port}' in page.locator('#theme-status').text_content()
+        page.unroute('**/musicbee-theme.json')
+        page.wait_for_function("document.getElementById('theme-status').textContent.includes('Colores conectados') && effectiveConfig().color_a.startsWith('hsl(125 ')")
         page.locator('#link-colors').uncheck()
         overlay.wait_for_function("!config.link_colors && effectiveConfig().color_a==='#56e1ff'")
+        page.wait_for_function("document.getElementById('theme-status').textContent==='Colores manuales'")
         with visualizers._audio_updated:
             visualizers._cfg.update(link_colors=True,audio_mode='obs')
             visualizers._audio_seq+=1;visualizers._audio_updated.notify_all()
@@ -148,7 +163,7 @@ try:
         assert page.evaluate('Math.max(...main.v)<.001')
         assert not errors, errors
         browser.close()
-    print('PASS: 38 distinct rendered styles; independent attack/release and spatial smoothing; 1024 waveform points; gallery category filters and offscreen rendering; shared MusicBee audio through both actual HTTP servers; all 38 gallery presets applied to actual overlay; preset URLs; MusicBee cover colors and track change; restore manual colors; independent audio color link; silence; gallery-only demo; live style/config changes; transparency/background; density/thickness; responsive canvas; fixed-style URL; disable; no JavaScript errors.')
+    print('PASS: 38 distinct rendered styles; independent attack/release and spatial smoothing; 1024 waveform points; gallery filters and offscreen rendering; shared audio; all 38 presets applied to actual overlay; preset URLs; cover fallback without Image.decode; directly published colors without cover downloads; same-revision palette and track changes; visible connection errors and recovery; restore manual colors; independent audio color link; silence; gallery-only demo; live config; transparency/background; responsive canvas; fixed-style URL; disable; no JavaScript errors.')
 finally:
     visualizers._stop.set()
     worker.join(3)

@@ -28,10 +28,14 @@ ni se necesita VB-CABLE. El osciloscopio usa muestras reales, no una onda sinté
 
 Activa **Conectar colores al overlay de MusicBee** en las propiedades de
 `obs_visualizers.py`, o marca **Colores del overlay MusicBee** en la galería.
+Para `http://localhost:8765/`, deja **Puerto del overlay de MusicBee** en **8765**.
 Todos los presets usarán los mismos colores principal y secundario de la portada
 que el overlay. Si habilitas el fondo sólido, también seguirá su color de fondo.
 
-Al cambiar de canción se actualiza la paleta. La portada se procesa al cambiar,
+La tarjeta de MusicBee publica sus colores en `http://localhost:8765/theme.json`;
+el visualizador lee esa paleta directamente. La galería muestra **Colores conectados**
+y la dirección utilizada, o el error de conexión. Al cambiar de canción se actualiza
+la paleta. Si la tarjeta no está abierta, la portada se procesa al cambiar,
 fuera del bucle de dibujo; no se vuelve a analizar en cada cuadro. Funciona
 incluso si solo tienes cargado el script de MusicBee y su tarjeta no está abierta.
 También puedes vincular los colores mientras usas una fuente de audio independiente:
@@ -40,6 +44,12 @@ el campo **Puerto del overlay de MusicBee** permanece visible al activar la opci
 Desactiva la conexión para recuperar tus colores manuales. Si el overlay no está
 disponible, se usan esos colores; si no hay portada, se usa el tono base del overlay.
 No necesitas instalar dependencias adicionales para esta opción.
+
+Si vienes de la versión anterior, actualiza **ambos scripts**, recárgalos en OBS
+y pulsa **Actualizar caché de la página actual** en las fuentes de navegador.
+En `http://localhost:8766/musicbee-theme.json` puedes comprobar `rev`, `has_cover`
+y `colors`; este último contiene la paleta publicada por la tarjeta, o `null` si
+todavía se está calculando o la tarjeta no está abierta.
 
 ## Activar los 60 FPS en OBS
 

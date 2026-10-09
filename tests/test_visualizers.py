@@ -7,7 +7,8 @@ import time
 import types
 import unittest
 from pathlib import Path
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
+from urllib.error import HTTPError
 
 import numpy as np
 from unittest.mock import patch
@@ -185,7 +186,7 @@ class VisualizerTests(unittest.TestCase):
         base = f'http://127.0.0.1:{self.module._httpd_port}'
         try:
             with urlopen(base + '/musicbee-theme.json') as response:
-                self.assertEqual(json.load(response), {'rev': 4, 'has_cover': True})
+                self.assertEqual(json.load(response), {'rev': 4, 'has_cover': True, 'colors': None})
             with urlopen(base + '/musicbee-cover?rev=4') as response:
                 self.assertEqual(response.headers.get_content_type(), 'image/png')
                 self.assertEqual(response.read(), b'cover fixture')
@@ -196,10 +197,64 @@ class VisualizerTests(unittest.TestCase):
                 self.module._musicbee_cover(3)
             musicbee._state.update(cover=None, rev=6)
             with urlopen(base + '/musicbee-theme.json') as response:
-                self.assertEqual(json.load(response), {'rev': 6, 'has_cover': False})
+                self.assertEqual(json.load(response), {'rev': 6, 'has_cover': False, 'colors': None})
         finally:
             self.module._stop_server()
             musicbee._stop_server()
+
+    def test_published_palette_is_proxied_and_stale_updates_are_rejected(self):
+        musicbee = load_script()
+        musicbee._state.update(cover=b'fixture', rev=20)
+        musicbee._start_server(0)
+        self.module._cfg['musicbee_port'] = musicbee._httpd_port
+        self.module._start_server(0)
+        source = f'http://127.0.0.1:{musicbee._httpd_port}'
+        proxy = f'http://127.0.0.1:{self.module._httpd_port}'
+        colors = {'color_a': 'hsl(5 100% 46%)', 'color_b': 'hsl(43 100% 62%)', 'background_color': 'hsl(5 32% 9%)'}
+        def publish(rev, palette, origin=source):
+            return urlopen(Request(source + '/palette', data=json.dumps({'rev': rev, 'colors': palette}).encode(),
+                                   headers={'Content-Type': 'application/json', 'Origin': origin}))
+        try:
+            with publish(20, colors) as response:
+                self.assertTrue(json.load(response)['ok'])
+            with urlopen(proxy + '/musicbee-theme.json') as response:
+                self.assertEqual(json.load(response), {'rev': 20, 'has_cover': True, 'colors': colors})
+            musicbee._state['rev'] = 21
+            with urlopen(source + '/theme.json') as response:
+                self.assertIsNone(json.load(response)['colors'])
+            for rev, palette, origin, status in [
+                (20, colors, source, 409),
+                (21, {**colors, 'color_a': 'url(example)'}, source, 400),
+                (21, colors, 'https://example.com', 403),
+            ]:
+                with self.assertRaises(HTTPError) as error:
+                    publish(rev, palette, origin)
+                self.assertEqual(error.exception.code, status)
+            with publish(21, colors) as response:
+                self.assertEqual(response.status, 200)
+        finally:
+            self.module._stop_server()
+            musicbee._stop_server()
+
+    def test_theme_proxy_supports_old_overlay_and_reports_connection_errors(self):
+        self.module._start_server(0)
+        base = f'http://127.0.0.1:{self.module._httpd_port}'
+        old_info = json.dumps({'rev': 20, 'has_cover': True}).encode()
+        try:
+            with patch.object(self.module, '_musicbee_request', side_effect=[
+                HTTPError('http://localhost:8765/theme.json', 404, 'missing', {}, None),
+                (8765, old_info, 'application/json', None),
+            ]) as request:
+                with urlopen(base + '/musicbee-theme.json') as response:
+                    self.assertEqual(json.load(response), {'rev': 20, 'has_cover': True, 'colors': None})
+                self.assertEqual([call.args[0] for call in request.call_args_list], ['/theme.json', '/now.json'])
+            with patch.object(self.module, '_musicbee_request', side_effect=OSError('connection failed')):
+                with self.assertRaises(HTTPError) as error:
+                    urlopen(base + '/musicbee-theme.json')
+                self.assertEqual(error.exception.code, 503)
+                self.assertIn('http://localhost:8765/', json.load(error.exception)['error'])
+        finally:
+            self.module._stop_server()
 
 
 if __name__ == '__main__':

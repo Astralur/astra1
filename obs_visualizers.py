@@ -15,6 +15,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit, parse_qs
+from urllib.error import HTTPError
 from urllib.request import build_opener, ProxyHandler
 
 import obspython as obs
@@ -472,6 +473,7 @@ body.gallery{background:#0b1020;overflow:auto;height:auto;min-height:100vh;
 .kicker{color:var(--a);font-size:10px;letter-spacing:.2em;font-weight:700;margin:0 0 8px}
 h1{font-size:30px;line-height:1.1;letter-spacing:-.04em;margin:0}header p{font-size:13px;color:var(--muted);margin:10px 0 0}
 .options{display:flex;flex-direction:column;gap:8px}.demo{display:flex;align-items:center;gap:9px;padding:10px 14px;border:1px solid var(--line);border-radius:999px;font-size:12px;white-space:nowrap;cursor:pointer}
+#theme-status{font-size:12px;color:var(--muted);max-width:360px;line-height:1.5;overflow-wrap:anywhere}
 .demo input{accent-color:var(--a);width:15px;height:15px}
 .gallery .hero{height:auto;overflow:hidden;border:1px solid var(--line);border-radius:18px;background:rgba(5,10,21,.7)}
 .gallery .hero-bar{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:16px 20px;border-bottom:1px solid rgba(255,255,255,.05)}
@@ -493,7 +495,7 @@ h1{font-size:30px;line-height:1.1;letter-spacing:-.04em;margin:0}header p{font-s
 </style></head>
 <body><main id="app">
 <header><div><p class="kicker">AUDIO / OBS</p><h1>Encuentra tu ritmo.</h1><p>38 formas de ver la misma música. Elige la que más te guste.</p></div>
-<div class="options"><label class="demo"><input id="demo" type="checkbox">Comparar con demostración</label><label class="demo"><input id="link-colors" type="checkbox">Colores del overlay MusicBee</label></div></header>
+<div class="options"><label class="demo"><input id="demo" type="checkbox">Comparar con demostración</label><label class="demo"><input id="link-colors" type="checkbox">Colores del overlay MusicBee</label><output id="theme-status" role="status">Colores manuales</output></div></header>
 <section class="hero"><div class="hero-bar"><span class="hero-title" id="selected">Ondas suaves</span><span id="signal">Esperando audio de MusicBee</span></div><canvas id="main" aria-label="Visualizador de audio"></canvas></section>
 <div class="actions"><button id="use-preset" type="button">Usar en OBS</button><button id="copy-url" type="button">Copiar URL</button><a id="open-overlay" target="_blank" rel="noopener">Abrir overlay</a><output id="preset-status" role="status"></output><input id="preset-url" readonly aria-label="URL del preset para la fuente de navegador"></div>
 <nav class="filters" id="filters" aria-label="Filtrar estilos"></nav>
@@ -506,7 +508,7 @@ const gallery=location.pathname.replace(/\/$/,'')==='/compare';
 if(gallery)document.body.classList.add('gallery');
 const queryStyle=new URLSearchParams(location.search).get('style');
 let selection=STYLES[queryStyle]?queryStyle:'ribbon', clicked=false;
-let config={style:'ribbon',color_a:'#56e1ff',color_b:'#ad72ff',background_color:'#081018',background:false,glow:true,intensity:1,smoothing:.2,attack_ms:18,release_ms:140,thickness:3,density:64};
+let config={style:'ribbon',color_a:'#56e1ff',color_b:'#ad72ff',background_color:'#081018',background:false,glow:true,intensity:1,smoothing:.2,attack_ms:18,release_ms:140,thickness:3,density:64,link_colors:false,musicbee_port:8765};
 let packet={bands:new Array(128).fill(0),wave:new Array(1024).fill(0),level:0,ready:false,source:'',error:null};
 let received=0, demo=false;
 let overlayPalette=null,paletteKey='',palettePort=null,themeBusy=false;
@@ -702,17 +704,33 @@ function coverPalette(image){
 }
 function palette(h,s){s=Math.min(1,Math.max(.55,s));return{color_a:`hsl(${h} ${s*100}% 46%)`,color_b:`hsl(${(h+38)%360} ${Math.min(100,s*100+10)}% 62%)`,background_color:`hsl(${h} 32% 9%)`};}
 function effectiveConfig(){return config.link_colors&&overlayPalette&&palettePort===config.musicbee_port?{...config,...overlayPalette}:config;}
-function refreshColors(){const c=effectiveConfig();document.documentElement.style.setProperty('--a',c.color_a);document.documentElement.style.setProperty('--b',c.color_b);}
+function refreshColors(){const c=effectiveConfig();document.documentElement.style.setProperty('--a',c.color_a);document.documentElement.style.setProperty('--b',c.color_b);if(!gallery)document.body.style.background=config.background?c.background_color:'transparent';}
+function themeStatus(text){if(gallery)document.getElementById('theme-status').textContent=text;}
+function loadCover(revision){
+ return new Promise((resolve,reject)=>{
+  const image=new Image(),timer=setTimeout(()=>{image.onload=image.onerror=null;reject(Error('La portada tarda demasiado en responder.'));},5000);
+  image.onload=()=>{clearTimeout(timer);resolve(image);};
+  image.onerror=()=>{clearTimeout(timer);reject(Error('No se pudo leer la portada de MusicBee.'));};
+  image.src='/musicbee-cover?rev='+encodeURIComponent(revision);
+ });
+}
+function validColors(colors){return colors&&['color_a','color_b','background_color'].every(key=>typeof colors[key]==='string'&&CSS.supports('color',colors[key]));}
 async function syncTheme(){
- if(!config.link_colors||themeBusy)return;themeBusy=true;const port=config.musicbee_port;
+ if(!config.link_colors){themeStatus('Colores manuales');return;}
+ if(themeBusy)return;themeBusy=true;const port=config.musicbee_port,url=`http://localhost:${port}/`;
+ if(!overlayPalette)themeStatus(`Conectando colores a ${url}`);
  try{
-  const response=await fetch('/musicbee-theme.json',{cache:'no-store'});if(!response.ok)throw Error('Sin overlay');const info=await response.json(),key=port+':'+info.rev+':'+info.has_cover;
-  if(paletteKey===key&&overlayPalette&&palettePort===port)return;
-  let colors=palette(200,.55);
-  if(info.has_cover){const image=new Image();image.src='/musicbee-cover?rev='+encodeURIComponent(info.rev);await image.decode();colors=coverPalette(image);}
+  const response=await fetch('/musicbee-theme.json',{cache:'no-store'}),info=await response.json();if(!response.ok)throw Error(info.error||'Overlay no disponible.');
+  const published=validColors(info.colors),key=port+':'+info.rev+':'+info.has_cover+':'+JSON.stringify(published?info.colors:null);
+  const status=`Colores conectados a ${url}`+(published?' · paleta del overlay':info.has_cover?' · paleta de la portada':' · sin portada');
   if(!config.link_colors||config.musicbee_port!==port)return;
-  overlayPalette=colors;paletteKey=key;palettePort=port;refreshColors();if(!gallery&&config.background)document.body.style.background=colors.background_color;
- }catch(e){if(config.musicbee_port===port){overlayPalette=null;paletteKey='';refreshColors();}}
+  if(paletteKey===key&&overlayPalette&&palettePort===port){themeStatus(status);return;}
+  let colors=palette(200,.55);
+  if(published)colors=info.colors;
+  else if(info.has_cover)colors=coverPalette(await loadCover(info.rev));
+  if(!config.link_colors||config.musicbee_port!==port)return;
+  overlayPalette=colors;paletteKey=key;palettePort=port;refreshColors();themeStatus(status);
+ }catch(e){if(config.link_colors&&config.musicbee_port===port){overlayPalette=null;paletteKey='';refreshColors();themeStatus(`Error de colores en ${url}: ${e.message}`);}}
  finally{themeBusy=false;}
 }
 setInterval(syncTheme,1000);
@@ -889,11 +907,20 @@ class _Handler(BaseHTTPRequestHandler):
         path = urlsplit(self.path).path.rstrip('/') or '/'
         if path == '/musicbee-theme.json':
             try:
-                _, raw, _, _ = _musicbee_request('/now.json', 65536)
+                try:
+                    _, raw, _, _ = _musicbee_request('/theme.json', 65536)
+                except HTTPError as error:
+                    if error.code not in (404, 501):
+                        raise
+                    # Compatibilidad con el overlay anterior, que solo expone la portada.
+                    _, raw, _, _ = _musicbee_request('/now.json', 65536)
                 info = json.loads(raw)
-                self._send_json(200, {'rev': int(info['rev']), 'has_cover': info.get('has_cover') is True})
-            except (OSError, ValueError, KeyError, TypeError, RuntimeError):
-                self._send_json(503, {'error': 'Overlay de MusicBee no disponible.'})
+                self._send_json(200, {'rev': int(info['rev']), 'has_cover': info.get('has_cover') is True,
+                                      'colors': info.get('colors')})
+            except (OSError, ValueError, KeyError, TypeError, RuntimeError) as error:
+                with _lock:
+                    port = _cfg['musicbee_port']
+                self._send_json(503, {'error': f'No se pudo leer el overlay en http://localhost:{port}/: {error}'})
             return
         if path == '/musicbee-cover':
             try:

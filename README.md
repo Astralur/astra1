@@ -50,6 +50,14 @@ La forma de las ondas sigue cambiando con la música.
 Esta ganancia solo se aplica a una **copia** de las muestras que calcula el
 visualizador: **no cambia el volumen audible de MusicBee ni el de la fuente de OBS**.
 
+## 60 FPS
+
+Al cargar los scripts, sus fuentes de navegador locales se configuran con una
+frecuencia personalizada de **60 FPS**. Selecciona también **60 FPS** en
+**Ajustes → Vídeo** de OBS para que la grabación o emisión conserve esa cadencia.
+La onda se anima a 60 FPS y conserva los controles de suavizado, subida y caída.
+Consulta [la configuración y los presets](VISUALIZERS.md#activar-los-60-fps-en-obs).
+
 ## Detalle y rapidez de las ondas
 
 El análisis usa 128 bandas y comparte 1.024 muestras reales de onda con el script
@@ -78,5 +86,6 @@ requiere ejecutar el script dentro de OBS en Windows 10/11.
 
 El script separado [obs_visualizers.py](obs_visualizers.py) ofrece **38 presets** y
 una galería para compararlos. Por defecto comparte este mismo audio de MusicBee,
-incluyendo la captura con la fuente silenciada. Consulta
+incluyendo la captura con la fuente silenciada. También permite conectar sus
+colores a la paleta de la portada del overlay. Consulta
 [las instrucciones de visualizadores](VISUALIZERS.md).

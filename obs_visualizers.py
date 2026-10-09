@@ -14,7 +14,7 @@ import queue
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, parse_qs
 from urllib.request import build_opener, ProxyHandler
 
 import obspython as obs
@@ -67,7 +67,7 @@ _cfg = {
     "audio_source": "", "port": 8766, "style": "ribbon",
     "visualizer": True, "normalize": True,
     "color_a": 0xFFFFE156, "color_b": 0xFFFF72AD, "background_color": 0xFF181008,
-    "background": False, "glow": True,
+    "background": False, "glow": True, "link_colors": False,
     "attack_ms": 18.0, "release_ms": 140.0,
     "intensity": 1.0, "smoothing": .2, "thickness": 3.0, "density": 48,
 }
@@ -76,6 +76,11 @@ _audio_updated = threading.Condition(_lock)
 _audio_seq = 0
 _stop = threading.Event()
 _audio_thread = None
+_settings_ref = None
+_pending_style = None
+_pending_color_link = None
+_cover_cache = None
+_last_browser_scan = 0.0
 _httpd = None
 _httpd_port = None
 _audio_ok = False
@@ -155,7 +160,7 @@ class _SpectrumProcessor:
         limit = self.n - WAVE_POINTS
         crossings = np.flatnonzero((signal[:limit + 1] <= 0) & (signal[1:limit + 2] > 0)) if limit else []
         start = int(crossings[-1]) if len(crossings) else limit
-        self.wave = np.clip(signal[start:start + WAVE_POINTS], -1, 1).round(5).tolist()
+        self.wave = np.clip(signal[start:start + WAVE_POINTS], -1, 1).astype(float).round(5).tolist()
         out = []
         for i, bins in enumerate(self.idx):
             db = 20 * np.log10(float(mag[bins].max()) + 1e-9)
@@ -459,19 +464,21 @@ OVERLAY_HTML = r"""<!doctype html>
 :root{color-scheme:dark;--a:#56e1ff;--b:#ad72ff;--text:#edf4fa;--muted:#9faec2;--line:rgba(255,255,255,.1)}
 *{box-sizing:border-box}html,body{margin:0;width:100%;height:100%;background:transparent;font-family:system-ui,"Segoe UI",sans-serif;color:var(--text)}
 body{overflow:hidden}button{font:inherit}#app,.hero{width:100%;height:100%}canvas{display:block;width:100%;height:100%}
-header,.hero-bar,.grid,footer,.filters{display:none}
+header,.hero-bar,.grid,footer,.filters,.actions{display:none}
 body.gallery{background:#0b1020;overflow:auto;height:auto;min-height:100vh;
  background-image:radial-gradient(ellipse at 8% 0%,rgba(86,225,255,.08),transparent 45%),radial-gradient(ellipse at 100% 50%,rgba(173,114,255,.08),transparent 45%)}
 .gallery #app{max-width:1240px;height:auto;margin:auto;padding:30px}
 .gallery header{display:flex;align-items:center;justify-content:space-between;gap:20px;margin-bottom:22px}
 .kicker{color:var(--a);font-size:10px;letter-spacing:.2em;font-weight:700;margin:0 0 8px}
 h1{font-size:30px;line-height:1.1;letter-spacing:-.04em;margin:0}header p{font-size:13px;color:var(--muted);margin:10px 0 0}
-.demo{display:flex;align-items:center;gap:9px;padding:10px 14px;border:1px solid var(--line);border-radius:999px;font-size:12px;white-space:nowrap;cursor:pointer}
+.options{display:flex;flex-direction:column;gap:8px}.demo{display:flex;align-items:center;gap:9px;padding:10px 14px;border:1px solid var(--line);border-radius:999px;font-size:12px;white-space:nowrap;cursor:pointer}
 .demo input{accent-color:var(--a);width:15px;height:15px}
 .gallery .hero{height:auto;overflow:hidden;border:1px solid var(--line);border-radius:18px;background:rgba(5,10,21,.7)}
 .gallery .hero-bar{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:16px 20px;border-bottom:1px solid rgba(255,255,255,.05)}
 .hero-title{font-size:14px;font-weight:600}#signal{font-size:11px;color:var(--muted)}#signal.demo-on{color:#ffcb78}
 .gallery #main{height:220px}
+.gallery .actions{display:flex;flex-wrap:wrap;align-items:center;gap:10px;position:sticky;top:10px;z-index:2;margin-top:14px;padding:12px;background:#101a2b;border:1px solid var(--line);border-radius:12px}
+.actions button,.actions a{border:1px solid var(--line);border-radius:8px;padding:8px 12px;background:transparent;color:var(--text);font:inherit;font-size:12px;cursor:pointer;text-decoration:none}.actions #use-preset{background:var(--a);color:#081018;border-color:var(--a);font-weight:600}.actions button:disabled{opacity:.6;cursor:default}.actions output{font-size:12px;color:var(--muted)}.actions input{min-width:180px;flex:1;background:#081018;border:1px solid var(--line);border-radius:6px;color:var(--muted);padding:7px;font-size:11px}
 .gallery .filters{display:flex;gap:8px;flex-wrap:wrap;margin-top:18px}.filters button{padding:8px 13px;border:1px solid var(--line);border-radius:999px;background:transparent;color:var(--muted);font-size:12px;cursor:pointer}.filters button[aria-pressed=true]{background:rgba(86,225,255,.1);border-color:var(--a);color:var(--text)}
 .gallery .grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-top:18px}
 .preset{text-align:left;color:var(--text);border:1px solid var(--line);border-radius:14px;padding:0;overflow:hidden;
@@ -486,11 +493,12 @@ h1{font-size:30px;line-height:1.1;letter-spacing:-.04em;margin:0}header p{font-s
 </style></head>
 <body><main id="app">
 <header><div><p class="kicker">AUDIO / OBS</p><h1>Encuentra tu ritmo.</h1><p>38 formas de ver la misma música. Elige la que más te guste.</p></div>
-<label class="demo"><input id="demo" type="checkbox">Comparar con demostración</label></header>
+<div class="options"><label class="demo"><input id="demo" type="checkbox">Comparar con demostración</label><label class="demo"><input id="link-colors" type="checkbox">Colores del overlay MusicBee</label></div></header>
 <section class="hero"><div class="hero-bar"><span class="hero-title" id="selected">Ondas suaves</span><span id="signal">Esperando audio de MusicBee</span></div><canvas id="main" aria-label="Visualizador de audio"></canvas></section>
+<div class="actions"><button id="use-preset" type="button">Usar en OBS</button><button id="copy-url" type="button">Copiar URL</button><a id="open-overlay" target="_blank" rel="noopener">Abrir overlay</a><output id="preset-status" role="status"></output><input id="preset-url" readonly aria-label="URL del preset para la fuente de navegador"></div>
 <nav class="filters" id="filters" aria-label="Filtrar estilos"></nav>
 <section class="grid" id="grid" aria-label="Estilos de visualizador"></section>
-<footer>Para usar tu elección, selecciona <strong id="choice-label">Ondas suaves</strong> en <strong>Estilo</strong>, en las propiedades del script de OBS. La demostración solo se muestra en esta galería.</footer>
+<footer>Pulsa <strong>Usar en OBS</strong> para aplicar <strong id="choice-label">Ondas suaves</strong> a la fuente principal. Puedes copiar su URL para usarlo en otra fuente. Configura también el vídeo de OBS a <strong>60 FPS</strong>. La demostración solo se muestra en esta galería.</footer>
 </main>
 <script>
 const STYLES={"bars":"Barras clásicas","mirror":"Barras espejo","ribbon":"Ondas suaves","scope":"Osciloscopio","ring":"Espectro circular","orbit":"Anillo fluido","dots":"Barras LED","particles":"Partículas","bars_peaks":"Barras con picos","bars_horizontal":"Barras horizontales","bars_split":"Barras enfrentadas","bars_edges":"Barras desde los bordes","bars_center":"Barras hacia el centro","bars_rounded":"Píldoras","bars_thin":"Líneas finas","bars_steps":"Escalones","ribbon_outline":"Contorno de onda","ribbon_layers":"Ondas en capas","ribbon_single":"Montaña de frecuencias","ribbon_dual":"Ondas cruzadas","ribbon_tunnel":"Túnel de ondas","scope_double":"Osciloscopio doble","scope_fill":"Osciloscopio relleno","scope_dots":"Osciloscopio punteado","scope_trail":"Estela de osciloscopio","scope_xy":"Órbita de la señal","ring_inward":"Anillo hacia dentro","ring_double":"Doble anillo","ring_dots":"Círculo de puntos","ring_polygon":"Polígono reactivo","ring_spiral":"Espiral espectral","ring_flower":"Flor sonora","ring_sun":"Rayos de sonido","orbit_radar":"Radar sonoro","orbit_ripples":"Ecos circulares","grid_heat":"Mosaico espectral","particles_fountain":"Fuente de partículas","particles_constellation":"Constelación"};
@@ -501,31 +509,35 @@ let selection=STYLES[queryStyle]?queryStyle:'ribbon', clicked=false;
 let config={style:'ribbon',color_a:'#56e1ff',color_b:'#ad72ff',background_color:'#081018',background:false,glow:true,intensity:1,smoothing:.2,attack_ms:18,release_ms:140,thickness:3,density:64};
 let packet={bands:new Array(128).fill(0),wave:new Array(1024).fill(0),level:0,ready:false,source:'',error:null};
 let received=0, demo=false;
+let overlayPalette=null,paletteKey='',palettePort=null,themeBusy=false;
 const clamp=(v,a=0,b=1)=>Math.min(b,Math.max(a,Number.isFinite(v)?v:0));
-function resample(values,n){const last=values.length-1;return Array.from({length:n},(_,i)=>{const p=i*last/(n-1),j=Math.floor(p);return (values[j]||0)*(1-p+j)+(values[Math.min(last,j+1)]||0)*(p-j)});}
+function resample(values,n){if(values.length===n)return values;const last=values.length-1;return Array.from({length:n},(_,i)=>{const p=i*last/(n-1),j=Math.floor(p);return (values[j]||0)*(1-p+j)+(values[Math.min(last,j+1)]||0)*(p-j)});}
 function curve(g,points){g.moveTo(...points[0]);for(let i=1;i<points.length-1;i++){g.quadraticCurveTo(...points[i],(points[i][0]+points[i+1][0])/2,(points[i][1]+points[i+1][1])/2);}g.lineTo(...points[points.length-1]);}
-function rounded(g,x,y,w,h,r){r=Math.min(r,w/2,h/2);g.beginPath();g.moveTo(x+r,y);g.arcTo(x+w,y,x+w,y+h,r);g.arcTo(x+w,y+h,x,y+h,r);g.arcTo(x,y+h,x,y,r);g.arcTo(x,y,x+w,y,r);g.closePath();g.fill();}
+function rounded(g,x,y,w,h,r,fill=true){r=Math.min(r,w/2,h/2);if(fill)g.beginPath();g.moveTo(x+r,y);g.arcTo(x+w,y,x+w,y+h,r);g.arcTo(x+w,y+h,x,y+h,r);g.arcTo(x,y+h,x,y,r);g.arcTo(x,y,x+w,y,r);g.closePath();if(fill)g.fill();}
 class Visualizer{
- constructor(canvas,style){this.canvas=canvas;this.g=canvas.getContext('2d');this.style=style;this.v=new Array(128).fill(0);this.wave=new Array(1024).fill(0);this.waveReference=.48;this.peaks=new Array(128).fill(0);this.trails=[];this.ripples=[];this.lastBass=0;this.visible=!gallery;this.level=0;this.phase=0;this.w=0;this.h=0;this.key='';this.observer=new ResizeObserver(()=>this.resize());this.observer.observe(canvas);this.resize();if(gallery){this.visibility=new IntersectionObserver(entries=>{this.visible=entries[0].isIntersecting;},{rootMargin:"100px"});this.visibility.observe(canvas);}}
- resize(){const r=this.canvas.getBoundingClientRect();this.w=r.width;this.h=r.height;const d=Math.min(window.devicePixelRatio||1,gallery?1.5:2);this.canvas.width=Math.round(this.w*d);this.canvas.height=Math.round(this.h*d);this.g.setTransform(d,0,0,d,0,0);this.key='';}
+ constructor(canvas,style){this.canvas=canvas;this.surface=document.createElement('canvas');this.g=this.surface.getContext('2d');this.output=canvas.getContext('2d');this.history=document.createElement('canvas');this.historyContext=this.history.getContext('2d');this.style=style;this.lastStyle=style;this.waveSignal=[];this.waveKey=null;this.v=new Array(128).fill(0);this.wave=new Array(1024).fill(0);this.waveReference=.48;this.peaks=new Array(128).fill(0);this.trails=[];this.ripples=[];this.lastBass=0;this.visible=!gallery;this.level=0;this.phase=0;this.w=0;this.h=0;this.key='';this.observer=new ResizeObserver(()=>this.resize());this.observer.observe(canvas);this.resize();if(gallery){this.visibility=new IntersectionObserver(entries=>{this.visible=entries[0].isIntersecting;},{rootMargin:"100px"});this.visibility.observe(canvas);}}
+ resize(){const r=this.canvas.getBoundingClientRect();this.w=r.width;this.h=r.height;const d=Math.min(window.devicePixelRatio||1,gallery?1.5:2);this.canvas.width=this.surface.width=this.history.width=Math.round(this.w*d);this.canvas.height=this.surface.height=this.history.height=Math.round(this.h*d);this.g.setTransform(d,0,0,d,0,0);this.output.setTransform(d,0,0,d,0,0);this.key='';}
  draw(data,dt,c){
   const {g,w,h}=this;if(!w||!h||!this.visible)return;
-  const live=data.ready, bands=live?resample(data.bands,128):new Array(128).fill(0), wave=live?resample(data.wave,1024):new Array(1024).fill(0);
+  const live=data.ready, bands=live?resample(data.bands,128):null;
+  const scope=this.style==='scope'||this.style.startsWith('scope_');
+  if(this.lastStyle!==this.style){this.historyContext.clearRect(0,0,this.history.width,this.history.height);this.ripples=[];this.lastStyle=this.style;}
   const smooth=clamp(c.smoothing), attack=c.attack_ms>0?1-Math.exp(-dt*1000/c.attack_ms):1,release=c.release_ms>0?1-Math.exp(-dt*1000/c.release_ms):1;
-  for(let i=0;i<128;i++){const t=clamp(bands[i]);this.v[i]+=(t-this.v[i])*(t>this.v[i]?attack:release);this.peaks[i]=Math.max(this.v[i],this.peaks[i]*Math.exp(-dt*2));}
+  for(let i=0;i<128;i++){const t=bands?clamp(bands[i]):0;this.v[i]+=(t-this.v[i])*(t>this.v[i]?attack:release);this.peaks[i]=Math.max(this.v[i],this.peaks[i]*Math.exp(-dt*2));}
   const rawLevel=clamp(live?data.level:0);this.level+=(rawLevel-this.level)*(rawLevel>this.level?attack:release);
-  if(live&&rawLevel>.00001){this.wave=wave;this.waveReference=rawLevel;}
+  if(scope&&live&&rawLevel>.00001){this.wave=resample(data.wave,1024);this.waveReference=rawLevel;}
   const waveScale=Math.min(2,this.level/Math.max(.00001,this.waveReference));
-  const waveSignal=this.wave.map((v,i)=>v*(1-smooth)+smooth*((this.wave[Math.max(0,i-1)]+2*v+this.wave[Math.min(1023,i+1)])/4));
+  if(scope&&(this.waveKey!==this.wave||this.waveSmoothing!==smooth)){this.waveSignal=this.wave.map((v,i)=>v*(1-smooth)+smooth*((this.wave[Math.max(0,i-1)]+2*v+this.wave[Math.min(1023,i+1)])/4));this.waveKey=this.wave;this.waveSmoothing=smooth;}
+  const waveSignal=this.waveSignal;
   this.phase+=dt*this.level*.6;
   g.clearRect(0,0,w,h);g.globalAlpha=1;g.lineCap='round';g.lineJoin='round';
   const key=`${w},${h},${c.color_a},${c.color_b}`;if(key!==this.key){this.gradient=g.createLinearGradient(w*.08,h,w*.92,0);this.gradient.addColorStop(0,c.color_a);this.gradient.addColorStop(1,c.color_b);this.key=key;}
-  g.fillStyle=g.strokeStyle=this.gradient;g.shadowColor=c.color_a;g.shadowBlur=c.glow?Math.min(18,h*.08):0;g.lineWidth=c.thickness;
+  g.fillStyle=g.strokeStyle=this.gradient;g.shadowColor=c.color_a;g.shadowBlur=0;g.lineWidth=c.thickness;
   const n=Math.round(clamp(c.density,16,256)), values=resample(this.v.map((v,i)=>v*(1-smooth)+smooth*(this.v[Math.max(0,i-1)]+2*v+this.v[Math.min(127,i+1)])/4),n).map(v=>clamp(v*c.intensity)), pad=w*.07, width=w-2*pad;
   const mirrored=()=>{const half=resample(values,Math.ceil(n/2));return half.slice().reverse().concat(half);};
   if(this.style==='bars'||this.style==='mirror'){
    const vals=this.style==='mirror'?mirrored():values;const step=width/vals.length,bw=Math.max(1,step*.68);
-   vals.forEach((v,i)=>{const size=Math.max(1.5,v*h*(this.style==='mirror'?.36:.72));const y=this.style==='mirror'?h/2-size:h*.86-size;rounded(g,pad+i*step,y,bw,this.style==='mirror'?2*size:size,Math.min(3,bw/2));});
+   g.beginPath();vals.forEach((v,i)=>{const size=Math.max(1.5,v*h*(this.style==='mirror'?.36:.72));const y=this.style==='mirror'?h/2-size:h*.86-size;rounded(g,pad+i*step,y,bw,this.style==='mirror'?2*size:size,Math.min(3,bw/2),false);});g.fill();
   }else if(this.style==='ribbon'){
    const vals=mirrored(),step=width/(vals.length-1),mid=h/2;
    const top=vals.map((v,i)=>[pad+i*step,mid-Math.pow(v,.9)*h*.35]);const bottom=vals.map((v,i)=>[pad+i*step,mid+Math.pow(v,.9)*h*.29]).reverse();
@@ -541,8 +553,9 @@ class Visualizer{
    const size=Math.min(w,h),base=size*(.22+.025*this.level),cx=w/2,cy=h/2;
    for(let layer=2;layer>=0;layer--){const pts=values.map((v,i)=>{const a=i/n*Math.PI*2-Math.PI/2,rad=base+v*size*(.12+layer*.035);return[cx+Math.cos(a)*rad,cy+Math.sin(a)*rad];});pts.push(pts[0],pts[1]);g.beginPath();curve(g,pts);g.closePath();g.globalAlpha=layer===0?.9:.14;g.lineWidth=layer===0?c.thickness:c.thickness*2;g.stroke();}g.globalAlpha=1;
   }else if(this.style==='dots'){
-   const rows=12,step=width/n,dy=h*.72/rows,r=Math.max(.8,Math.min(step*.27,dy*.32));g.shadowBlur=c.glow?8:0;
-   values.forEach((v,i)=>{const lit=Math.round(v*rows);for(let j=0;j<rows;j++){g.globalAlpha=j<lit?1:.07;g.beginPath();g.arc(pad+(i+.5)*step,h*.86-j*dy,r,0,Math.PI*2);g.fill();}});g.globalAlpha=1;
+   const rows=12,step=width/n,dy=h*.72/rows,r=Math.max(.8,Math.min(step*.27,dy*.32));
+   // Agrupar los LED en dos caminos: apagados y encendidos, sin una sombra por LED.
+   for(const active of [false,true]){g.beginPath();g.globalAlpha=active?1:.07;values.forEach((v,i)=>{const lit=Math.round(v*rows);for(let j=0;j<rows;j++){if((j<lit)!==active)continue;const x=pad+(i+.5)*step,y=h*.86-j*dy;g.moveTo(x+r,y);g.arc(x,y,r,0,Math.PI*2);}});g.fill();}g.globalAlpha=1;
   }else if(this.style==='particles'){
    const size=Math.min(w,h),cx=w/2,cy=h/2;
    for(let i=0;i<96;i++){const v=values[i%n];if(v<.01)continue;const angle=i*2.399963+this.phase*((i%2)?1:-1),rad=size*(.06+.3*Math.sqrt((i+.5)/96))*(.65+.55*v);
@@ -561,12 +574,13 @@ class Visualizer{
     values.forEach((v,i)=>{const len=Math.max(1,v*h*.36),x=pad+i*step;rounded(g,x,h*.07,bw,len,2);rounded(g,x,h*.93-len,bw,len,2);});
    }else if(this.style==='bars_steps'){
     const rows=18,dy=h*.75/rows;
-    values.forEach((v,i)=>{for(let j=0;j<Math.round(v*rows);j++)rounded(g,pad+i*step,h*.88-(j+1)*dy,bw,dy*.65,1);});
+    g.beginPath();values.forEach((v,i)=>{for(let j=0;j<Math.round(v*rows);j++)g.rect(pad+i*step,h*.88-(j+1)*dy,bw,dy*.65);});g.fill();
    }else{
     const vals=this.style==='bars_rounded'?resample(values,Math.min(n,24)):values,dx=width/vals.length;
+    const peakValues=this.style==='bars_peaks'?resample(this.peaks,vals.length):null;
     vals.forEach((v,i)=>{const len=Math.max(2,v*h*.72),barw=this.style==='bars_thin'?Math.min(2,dx*.3):dx*(this.style==='bars_rounded'?.78:.65);
      rounded(g,pad+i*dx,h*.86-len,barw,len,this.style==='bars_rounded'?barw/2:2);
-     if(this.style==='bars_peaks'){const peak=resample(this.peaks,vals.length)[i];g.globalAlpha=.8;rounded(g,pad+i*dx,h*.86-clamp(peak*c.intensity)*h*.72-4,barw,2,1);g.globalAlpha=1;}
+     if(this.style==='bars_peaks'){const peak=peakValues[i];g.globalAlpha=.8;rounded(g,pad+i*dx,h*.86-clamp(peak*c.intensity)*h*.72-4,barw,2,1);g.globalAlpha=1;}
     });
    }
   }else if(this.style.startsWith('ribbon_')){
@@ -585,12 +599,15 @@ class Visualizer{
     }g.globalAlpha=1;
    }
   }else if(this.style.startsWith('scope_')){
-   const amplitude=h*.34,pts=waveSignal.map((v,i)=>[pad+i*width/(waveSignal.length-1),h/2-v*3.5*c.intensity*waveScale*amplitude]);
+   const amplitude=h*.34,pts=waveSignal.map((v,i)=>[pad+i*width/(waveSignal.length-1),h/2-clamp(v*3.5*c.intensity*waveScale,-1,1)*amplitude]);
    const line=points=>{g.beginPath();g.moveTo(...points[0]);for(let i=1;i<points.length;i++)g.lineTo(...points[i]);g.stroke();};
    if(this.style==='scope_fill'){g.beginPath();g.moveTo(...pts[0]);for(let i=1;i<pts.length;i++)g.lineTo(...pts[i]);g.lineTo(w-pad,h/2);g.lineTo(pad,h/2);g.closePath();g.globalAlpha=.35;g.fill();g.globalAlpha=1;line(pts);
    }else if(this.style==='scope_double'){for(const sign of [-1,1])line(pts.map(([x,y])=>[x,h/2+sign*(y-h/2)*.65+sign*h*.17]));
    }else if(this.style==='scope_dots'){for(let i=0;i<pts.length;i+=Math.max(1,Math.round(pts.length/n))){g.beginPath();g.arc(...pts[i],Math.max(1,c.thickness),0,Math.PI*2);g.fill();}
-   }else if(this.style==='scope_trail'){this.trails.push({points:pts,age:0});if(this.trails.length>12)this.trails.shift();for(const trail of this.trails){trail.age+=dt;g.globalAlpha=Math.max(0,1-trail.age/.4)*.45;line(trail.points);}g.globalAlpha=1;line(pts);
+   }else if(this.style==='scope_trail'){
+    // Persistencia en una textura: una onda por cuadro en vez de redibujar 12.
+    g.globalAlpha=Math.exp(-dt/.075);g.drawImage(this.history,0,0,w,h);g.globalAlpha=1;line(pts);
+    this.historyContext.clearRect(0,0,this.history.width,this.history.height);this.historyContext.drawImage(this.surface,0,0);
    }else if(this.style==='scope_xy'){const size=Math.min(w,h),rad=size*.27;g.beginPath();for(let i=0;i<waveSignal.length;i++){const a=i/waveSignal.length*Math.PI*2,rr=rad+waveSignal[i]*3*c.intensity*waveScale*size*.12;const x=w/2+Math.cos(a)*rr,y=h/2+Math.sin(a)*rr;i?g.lineTo(x,y):g.moveTo(x,y);}g.closePath();g.stroke();}
   }else if(this.style.startsWith('ring_')){
    const size=Math.min(w,h),rad=size*.27,cx=w/2,cy=h/2;
@@ -628,29 +645,93 @@ class Visualizer{
    for(let i=0;i<points.length;i++){const[x,y,v]=points[i];if(v<.025)continue;g.globalAlpha=v;g.beginPath();g.arc(x,y,Math.max(1,c.thickness*.6+v*3),0,Math.PI*2);g.fill();for(let j=i+1;j<points.length;j++){const[xx,yy,vv]=points[j];if(vv>.1&&Math.hypot(xx-x,yy-y)<Math.min(w,h)*.25){g.globalAlpha=Math.min(v,vv)*.22;g.lineWidth=1;g.beginPath();g.moveTo(x,y);g.lineTo(xx,yy);g.stroke();}}}g.globalAlpha=1;
   }
   g.shadowBlur=0;g.globalAlpha=1;
+  // Componer el brillo una sola vez para toda la geometría del cuadro.
+  const out=this.output;out.clearRect(0,0,w,h);out.shadowColor=c.color_a;out.shadowBlur=c.glow?Math.min(12,h*.06):0;out.drawImage(this.surface,0,0,w,h);out.shadowBlur=0;
  }
 }
 const main=new Visualizer(document.getElementById('main'),selection),renderers=[main];
-function select(style){selection=style;main.style=style;document.getElementById('selected').textContent=STYLES[style];document.getElementById('choice-label').textContent=STYLES[style];document.querySelectorAll('.preset').forEach(el=>el.setAttribute('aria-pressed',String(el.dataset.style===style)));}
+function presetURL(){return new URL('/?style='+encodeURIComponent(selection),location.href).href;}
+function updateChoice(){
+ if(!gallery)return;
+ const active=selection===config.style,button=document.getElementById('use-preset');
+ button.disabled=active;button.textContent=active?'En uso en OBS':'Usar en OBS';
+ document.getElementById('preset-url').value=presetURL();document.getElementById('open-overlay').href=presetURL();
+}
+function select(style){selection=style;main.style=style;document.getElementById('selected').textContent=STYLES[style];document.getElementById('choice-label').textContent=STYLES[style];document.querySelectorAll('.preset').forEach(el=>el.setAttribute('aria-pressed',String(el.dataset.style===style)));document.getElementById('preset-status').textContent='';updateChoice();}
 if(gallery){
  const group=id=>id.startsWith('particles')?'Partículas':id.startsWith('ring')||id.startsWith('orbit')?'Circulares':id.startsWith('scope')||id.startsWith('ribbon')?'Ondas':'Barras';
  for(const category of ['Todos','Barras','Ondas','Circulares','Partículas']){const button=document.createElement('button');button.type='button';button.textContent=category;button.setAttribute('aria-pressed',String(category==='Todos'));button.addEventListener('click',()=>{document.querySelectorAll('#filters button').forEach(b=>b.setAttribute('aria-pressed',String(b===button)));document.querySelectorAll('.preset').forEach(el=>{el.hidden=category!=='Todos'&&group(el.dataset.style)!==category;});});document.getElementById('filters').append(button);}
  for(const [id,label]of Object.entries(STYLES)){const button=document.createElement('button');button.type='button';button.className='preset';button.dataset.style=id;button.setAttribute('aria-label',label);const canvas=document.createElement('canvas');canvas.setAttribute('aria-hidden','true');const caption=document.createElement('div');caption.className='preset-label';const name=document.createElement('span');name.textContent=label;const check=document.createElement('span');check.className='choice';check.textContent='Elegido';caption.append(name,check);button.append(canvas,caption);document.getElementById('grid').append(button);renderers.push(new Visualizer(canvas,id));button.addEventListener('click',()=>{clicked=true;select(id);});}
- document.getElementById('demo').addEventListener('change',e=>{demo=e.target.checked;});select(selection);
+ document.getElementById('demo').addEventListener('change',e=>{demo=e.target.checked;});
+ document.getElementById('use-preset').addEventListener('click',async()=>{
+  const style=selection,button=document.getElementById('use-preset'),status=document.getElementById('preset-status');button.disabled=true;
+  try{const response=await fetch('/preset',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({style})});if(!response.ok)throw Error('No disponible');config.style=style;status.textContent=STYLES[style]+' aplicado a OBS';}
+  catch(e){status.textContent='No se pudo aplicar. Vuelve a intentarlo.';}
+  finally{updateChoice();}
+ });
+ document.getElementById('link-colors').addEventListener('change',async event=>{
+  const enabled=event.target.checked;event.target.disabled=true;
+  try{const response=await fetch('/colors',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled})});if(!response.ok)throw Error('No disponible');}
+  catch(e){event.target.checked=!!config.link_colors;document.getElementById('preset-status').textContent='No se pudo cambiar el color. Vuelve a intentarlo.';}
+  finally{event.target.disabled=false;}
+ });
+ document.getElementById('copy-url').addEventListener('click',async()=>{
+  const field=document.getElementById('preset-url'),status=document.getElementById('preset-status');
+  try{await navigator.clipboard.writeText(presetURL());status.textContent='URL copiada. Pégala en tu fuente de navegador.';}
+  catch(e){field.focus();field.select();status.textContent='Copia la URL seleccionada y pégala en tu fuente de navegador.';}
+ });select(selection);
 }
-function acceptState(s){packet=s;config=s.config;received=performance.now();document.documentElement.style.setProperty('--a',config.color_a);document.documentElement.style.setProperty('--b',config.color_b);
- if(!gallery){main.style=STYLES[queryStyle]?queryStyle:config.style;document.body.style.background=config.background?config.background_color:'transparent';}
- else if(!clicked&&!STYLES[queryStyle])select(config.style);
+function acceptState(s){const linkChanged=config.link_colors!==s.config.link_colors||config.musicbee_port!==s.config.musicbee_port;const colorChanged=config.color_a!==s.config.color_a||config.color_b!==s.config.color_b;packet=s;config=s.config;received=performance.now();if(colorChanged||linkChanged)refreshColors();if(linkChanged){if(!config.link_colors||palettePort!==config.musicbee_port){overlayPalette=null;paletteKey='';}if(gallery)document.getElementById('link-colors').checked=!!config.link_colors;syncTheme();}
+ if(!gallery){main.style=STYLES[queryStyle]?queryStyle:config.style;document.body.style.background=config.background?effectiveConfig().background_color:'transparent';}
+ else{if(!clicked&&!STYLES[queryStyle]&&selection!==config.style)select(config.style);updateChoice();}
 }
 async function poll(){try{const response=await fetch('/state.json',{cache:'no-store'});if(!response.ok)throw Error('No disponible');acceptState(await response.json());}catch(e){packet.ready=false;}finally{setTimeout(poll,8);}}
 function connect(){if(window.EventSource){const stream=new EventSource('/events');stream.onmessage=e=>{try{acceptState(JSON.parse(e.data));}catch(e){packet.ready=false;}};stream.onerror=()=>{packet.ready=false;};}else poll();}
 function demonstration(t){return{ready:true,bands:Array.from({length:128},(_,i)=>clamp((.3+.27*Math.sin(t*2.1-i*.32)+.15*Math.sin(t*.8+i*.65))*(1-i*.008))),wave:Array.from({length:1024},(_,i)=>.2*Math.sin(i*.19+t)+.055*Math.sin(i*.57-t)),level:.4+.08*Math.sin(t*2)};}
-let previous=performance.now(),lastPreview=0;
-function frame(now){const dt=Math.min(.05,(now-previous)/1000);previous=now;let data=gallery&&demo?demonstration(now/1000):{...packet,ready:packet.ready&&now-received<700};
- main.draw(data,dt,config);
- if(gallery&&now-lastPreview>=1000/30){const previewDt=Math.min(.1,(now-lastPreview)/1000);lastPreview=now;for(const renderer of renderers.slice(1))renderer.draw(data,previewDt,config);}
- if(gallery){const signal=document.getElementById('signal');signal.classList.toggle('demo-on',demo);signal.textContent=demo?'Demostración · sin audio real':data.ready?`Audio de OBS · ${data.source||'MusicBee'}`:'Esperando audio de MusicBee';}
+function rgb2hsl(r,g,b){
+ r/=255;g/=255;b/=255;const mx=Math.max(r,g,b),mn=Math.min(r,g,b),d=mx-mn,l=(mx+mn)/2;let h=0,s=0;
+ if(d){s=d/(1-Math.abs(2*l-1));if(mx===r)h=((g-b)/d)%6;else if(mx===g)h=(b-r)/d+2;else h=(r-g)/d+4;h*=60;if(h<0)h+=360;}
+ return[h,s,l];
+}
+function coverPalette(image){
+ const cv=document.createElement('canvas');cv.width=cv.height=32;const ctx=cv.getContext('2d');ctx.drawImage(image,0,0,32,32);
+ const pixels=ctx.getImageData(0,0,32,32).data,bins=new Array(36).fill(0),sat=new Array(36).fill(0);
+ for(let i=0;i<pixels.length;i+=4){const[h,s,l]=rgb2hsl(pixels[i],pixels[i+1],pixels[i+2]);if(l<.12||l>.9)continue;const weight=s*s*(1-Math.abs(l-.5)),bin=Math.floor(h/10)%36;bins[bin]+=weight;sat[bin]+=weight*s;}
+ let best=0;for(let i=1;i<36;i++)if(bins[i]>bins[best])best=i;
+ return bins[best]>.5?palette(best*10+5,sat[best]/bins[best]):palette(255,.35);
+}
+function palette(h,s){s=Math.min(1,Math.max(.55,s));return{color_a:`hsl(${h} ${s*100}% 46%)`,color_b:`hsl(${(h+38)%360} ${Math.min(100,s*100+10)}% 62%)`,background_color:`hsl(${h} 32% 9%)`};}
+function effectiveConfig(){return config.link_colors&&overlayPalette&&palettePort===config.musicbee_port?{...config,...overlayPalette}:config;}
+function refreshColors(){const c=effectiveConfig();document.documentElement.style.setProperty('--a',c.color_a);document.documentElement.style.setProperty('--b',c.color_b);}
+async function syncTheme(){
+ if(!config.link_colors||themeBusy)return;themeBusy=true;const port=config.musicbee_port;
+ try{
+  const response=await fetch('/musicbee-theme.json',{cache:'no-store'});if(!response.ok)throw Error('Sin overlay');const info=await response.json(),key=port+':'+info.rev+':'+info.has_cover;
+  if(paletteKey===key&&overlayPalette&&palettePort===port)return;
+  let colors=palette(200,.55);
+  if(info.has_cover){const image=new Image();image.src='/musicbee-cover?rev='+encodeURIComponent(info.rev);await image.decode();colors=coverPalette(image);}
+  if(!config.link_colors||config.musicbee_port!==port)return;
+  overlayPalette=colors;paletteKey=key;palettePort=port;refreshColors();if(!gallery&&config.background)document.body.style.background=colors.background_color;
+ }catch(e){if(config.musicbee_port===port){overlayPalette=null;paletteKey='';refreshColors();}}
+ finally{themeBusy=false;}
+}
+setInterval(syncTheme,1000);
+const FRAME_MS=1000/60;
+let previous=performance.now(),nextDraw=0;
+function frame(now){
  requestAnimationFrame(frame);
+ if(now+1<nextDraw)return;
+ nextDraw=nextDraw?nextDraw+FRAME_MS:now+FRAME_MS;if(nextDraw<now)nextDraw=now+FRAME_MS;
+ const dt=Math.min(.1,(now-previous)/1000);previous=now;
+ const data=gallery&&demo?demonstration(now/1000):{...packet,ready:packet.ready&&now-received<700};
+ const drawConfig=effectiveConfig();main.draw(data,dt,drawConfig);
+ if(gallery){
+  // Las miniaturas visibles también se actualizan a 60 FPS, sin brillo costoso.
+  const previewConfig={...drawConfig,glow:false,density:Math.min(64,config.density)};
+  for(let i=1;i<renderers.length;i++)renderers[i].draw(data,dt,previewConfig);
+  const signal=document.getElementById('signal');const label=demo?'Demostración · sin audio real':data.ready?`Audio de OBS · ${data.source||'MusicBee'}`:'Esperando audio de MusicBee';
+  if(signal.textContent!==label){signal.textContent=label;signal.classList.toggle('demo-on',demo);}
+ }
 }
 connect();requestAnimationFrame(frame);
 </script></body></html>
@@ -661,9 +742,59 @@ def _css_color(value):
     return '#{:02x}{:02x}{:02x}'.format(value & 255, (value >> 8) & 255, (value >> 16) & 255)
 
 
+def _set_color_link(enabled):
+    global _audio_seq, _pending_color_link
+    if not isinstance(enabled, bool):
+        raise ValueError('Opción de color no válida.')
+    with _audio_updated:
+        _cfg['link_colors'] = enabled
+        _pending_color_link = enabled
+        _audio_seq += 1
+        _audio_updated.notify_all()
+
+
+def _musicbee_request(path, limit):
+    with _lock:
+        port = _cfg['musicbee_port']
+    if port == _httpd_port:
+        raise RuntimeError('El puerto de MusicBee debe ser distinto del puerto de visualizadores.')
+    with _local_http.open(f'http://127.0.0.1:{port}{path}', timeout=.75) as response:
+        body = response.read(limit + 1)
+        mime = response.headers.get_content_type()
+        revision = response.headers.get('X-Cover-Revision')
+    if len(body) > limit:
+        raise RuntimeError('La respuesta de MusicBee es demasiado grande.')
+    return port, body, mime, revision
+
+
+def _musicbee_cover(revision):
+    global _cover_cache
+    with _lock:
+        port, cached = _cfg['musicbee_port'], _cover_cache
+    if cached and cached[:2] == (port, revision):
+        return cached[2:]
+    source_port, body, mime, actual_revision = _musicbee_request('/cover', 16 * 1024 * 1024)
+    if not mime.startswith('image/') or (actual_revision is not None and str(revision) != actual_revision):
+        raise RuntimeError('La portada ha cambiado. Vuelve a consultar sus colores.')
+    with _lock:
+        _cover_cache = (source_port, revision, body, mime)
+    return body, mime
+
+
+def _choose_preset(style):
+    global _audio_seq, _pending_style
+    if not isinstance(style, str) or style not in PRESETS:
+        raise ValueError('Preset desconocido.')
+    with _audio_updated:
+        _cfg['style'] = style
+        _pending_style = style
+        _audio_seq += 1
+        _audio_updated.notify_all()
+
+
 def _snapshot():
     with _lock:
-        config = {key: _cfg[key] for key in ('style', 'background', 'glow', 'intensity', 'smoothing', 'attack_ms', 'release_ms', 'thickness', 'density')}
+        config = {key: _cfg[key] for key in ('style', 'background', 'glow', 'intensity', 'smoothing', 'attack_ms', 'release_ms', 'thickness', 'density', 'link_colors', 'musicbee_port')}
         config.update({key: _css_color(_cfg[key]) for key in ('color_a', 'color_b', 'background_color')})
         ready = bool(_audio_ok and _cfg['visualizer'] and time.monotonic() - _audio['stamp'] < .3)
         return {
@@ -696,17 +827,90 @@ def _stream_state(handler, snapshot):
             payload = json.dumps(snapshot(), allow_nan=False, separators=(',', ':')).encode('utf-8')
             handler.wfile.write(b'data: ' + payload + b'\n\n')
             handler.wfile.flush()
-            next_frame = time.monotonic() + 1 / 120
+            next_frame = time.monotonic() + 1 / 60
     except (BrokenPipeError, ConnectionResetError, OSError):
         pass
 
 
 class _Handler(BaseHTTPRequestHandler):
+    disable_nagle_algorithm = True
+
     def log_message(self, *args):
         pass
 
+    def _send_json(self, code, payload):
+        body = json.dumps(payload, ensure_ascii=False).encode('utf-8')
+        try:
+            self.send_response(code)
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.send_header('Content-Length', str(len(body)))
+            self.send_header('Cache-Control', 'no-store')
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def do_POST(self):
+        path = urlsplit(self.path).path
+        if path not in ('/preset', '/colors'):
+            self._send_json(404, {'error': 'No encontrado.'})
+            return
+        if self.headers.get_content_type() != 'application/json':
+            self._send_json(415, {'error': 'Se requiere JSON.'})
+            return
+        origin = self.headers.get('Origin')
+        if origin:
+            try:
+                parsed = urlsplit(origin)
+                allowed = (parsed.scheme == 'http' and parsed.hostname in ('localhost', '127.0.0.1', '::1')
+                           and parsed.port == self.server.server_port)
+            except ValueError:
+                allowed = False
+            if not allowed:
+                self._send_json(403, {'error': 'Origen no permitido.'})
+                return
+        try:
+            length = int(self.headers.get('Content-Length', '0'))
+            if not 0 < length <= 1024:
+                raise ValueError('Petición no válida.')
+            payload = json.loads(self.rfile.read(length))
+            if not isinstance(payload, dict):
+                raise ValueError('Petición no válida.')
+            if path == '/preset':
+                _choose_preset(payload.get('style'))
+            else:
+                _set_color_link(payload.get('enabled'))
+        except (ValueError, TypeError):
+            self._send_json(400, {'error': 'Preset o petición no válido.'})
+            return
+        self._send_json(200, {'style': payload['style']} if path == '/preset' else {'enabled': payload['enabled']})
+
     def do_GET(self):
         path = urlsplit(self.path).path.rstrip('/') or '/'
+        if path == '/musicbee-theme.json':
+            try:
+                _, raw, _, _ = _musicbee_request('/now.json', 65536)
+                info = json.loads(raw)
+                self._send_json(200, {'rev': int(info['rev']), 'has_cover': info.get('has_cover') is True})
+            except (OSError, ValueError, KeyError, TypeError, RuntimeError):
+                self._send_json(503, {'error': 'Overlay de MusicBee no disponible.'})
+            return
+        if path == '/musicbee-cover':
+            try:
+                params = parse_qs(urlsplit(self.path).query)
+                revision = int(params.get('rev', ['-1'])[0])
+                if revision < 0:
+                    raise ValueError('Revisión de portada no válida.')
+                body, mime = _musicbee_cover(revision)
+                self.send_response(200)
+                self.send_header('Content-Type', mime)
+                self.send_header('Content-Length', str(len(body)))
+                self.send_header('Cache-Control', 'no-store')
+                self.end_headers()
+                self.wfile.write(body)
+            except (OSError, ValueError, RuntimeError):
+                self._send_json(503, {'error': 'Portada no disponible.'})
+            return
         if path == '/events':
             _stream_state(self, _snapshot)
             return
@@ -755,10 +959,11 @@ def script_description():
     return (
         '<b>OBS Visualizers</b><br>38 visualizadores para el audio de MusicBee. '
         'Por defecto comparten el audio de musicbee_nowplaying.py (puerto 8765). '
-        'Carga ambos scripts para usar ese modo.<br>'
+        'Carga ambos scripts para usar ese modo. Animación a 60 FPS.<br>'
         'Fuente de navegador: <code>http://localhost:8766/</code>, 900×300, '
         'o 600×600 para los estilos circulares. '
-        'Compara estilos en <code>http://localhost:8766/compare</code>.<br>'
+        'Compara y aplica los 38 presets en <code>http://localhost:8766/compare</code> '
+        'con Usar en OBS. Configura Ajustes → Vídeo de OBS a 60 FPS.<br>'
         'También puedes elegir una fuente directa de OBS. Ese modo requiere numpy '
         'en el Python de OBS. No utiliza VB-CABLE ni cambia el volumen audible.'
     )
@@ -795,14 +1000,16 @@ def _refresh_audio_sources(props, prop):
     return True
 
 
-def _mode_visibility(props, mode):
+def _mode_visibility(props, mode, link_colors=None):
     for name in ('audio_source', 'refresh_audio_sources', 'normalize', 'analysis_size'):
         obs.obs_property_set_visible(obs.obs_properties_get(props, name), mode == 'obs')
-    obs.obs_property_set_visible(obs.obs_properties_get(props, 'musicbee_port'), mode == 'musicbee')
+    if link_colors is None:
+        link_colors = _cfg['link_colors']
+    obs.obs_property_set_visible(obs.obs_properties_get(props, 'musicbee_port'), mode == 'musicbee' or link_colors)
 
 
 def _mode_changed(props, prop, settings):
-    _mode_visibility(props, obs.obs_data_get_string(settings, 'audio_mode'))
+    _mode_visibility(props, obs.obs_data_get_string(settings, 'audio_mode'), obs.obs_data_get_bool(settings, 'link_colors'))
     return True
 
 
@@ -824,6 +1031,8 @@ def script_properties():
         obs.obs_property_list_add_int(fft, str(size), size)
     obs.obs_properties_add_float_slider(props, 'attack_ms', 'Tiempo de subida (ms, 0 = inmediato)', 0.0, 1000.0, 5.0)
     obs.obs_properties_add_float_slider(props, 'release_ms', 'Tiempo de caída (ms, 0 = inmediato)', 0.0, 3000.0, 10.0)
+    color_link = obs.obs_properties_add_bool(props, 'link_colors', 'Conectar colores al overlay de MusicBee')
+    obs.obs_property_set_modified_callback(color_link, _mode_changed)
     obs.obs_properties_add_color(props, 'color_a', 'Color principal')
     obs.obs_properties_add_color(props, 'color_b', 'Color secundario')
     obs.obs_properties_add_float_slider(props, 'intensity', 'Intensidad', .2, 2.5, .1)
@@ -872,20 +1081,80 @@ def script_update(settings):
         _start_server(port)
 
 
+def _ensure_browser_fps():
+    """Solo las fuentes de navegador de este overlay, desde el hilo principal de OBS."""
+    with _lock:
+        port = _cfg['port']
+    sources = obs.obs_enum_sources()
+    if not sources:
+        return
+    try:
+        for source in sources:
+            if obs.obs_source_get_unversioned_id(source) != 'browser_source':
+                continue
+            settings = obs.obs_source_get_settings(source)
+            try:
+                try:
+                    url = urlsplit(obs.obs_data_get_string(settings, 'url'))
+                    matches = (url.scheme == 'http' and url.hostname in ('localhost', '127.0.0.1', '::1')
+                               and url.port == port and url.path.rstrip('/') in ('', '/overlay'))
+                except ValueError:
+                    matches = False
+                if matches and (not obs.obs_data_get_bool(settings, 'fps_custom')
+                                or obs.obs_data_get_int(settings, 'fps') != 60):
+                    obs.obs_data_set_bool(settings, 'fps_custom', True)
+                    obs.obs_data_set_int(settings, 'fps', 60)
+                    obs.obs_source_update(source, settings)
+            finally:
+                obs.obs_data_release(settings)
+    finally:
+        obs.source_list_release(sources)
+
+
+def _obs_tick():
+    global _pending_style, _pending_color_link, _last_browser_scan
+    with _lock:
+        pending, _pending_style = _pending_style, None
+        color_link, _pending_color_link = _pending_color_link, None
+    if color_link is not None and _settings_ref is not None:
+        obs.obs_data_set_bool(_settings_ref, 'link_colors', color_link)
+    if pending and _settings_ref is not None:
+        obs.obs_data_set_string(_settings_ref, 'style', pending)
+    now = time.monotonic()
+    if now - _last_browser_scan >= 1:
+        _ensure_browser_fps()
+        _last_browser_scan = now
+
+
+def script_save(settings):
+    with _lock:
+        style, color_link = _cfg['style'], _cfg['link_colors']
+    obs.obs_data_set_string(settings, 'style', style)
+    obs.obs_data_set_bool(settings, 'link_colors', color_link)
+
+
 def script_load(settings):
-    global _audio_thread
+    global _audio_thread, _settings_ref
+    obs.obs_data_addref(settings)
+    _settings_ref = settings
     _stop.clear()
     with _lock:
         port = _cfg['port']
     _start_server(port)
     _audio_thread = threading.Thread(target=_audio_worker, daemon=True)
     _audio_thread.start()
+    _ensure_browser_fps()
+    obs.timer_add(_obs_tick, 100)
 
 
 def script_unload():
-    global _audio_thread
+    global _audio_thread, _settings_ref
+    obs.timer_remove(_obs_tick)
     _stop.set()
     if _audio_thread is not None:
         _audio_thread.join(timeout=3)
         _audio_thread = None
     _stop_server()
+    if _settings_ref is not None:
+        obs.obs_data_release(_settings_ref)
+        _settings_ref = None

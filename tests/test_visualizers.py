@@ -176,6 +176,31 @@ class VisualizerTests(unittest.TestCase):
         finally:
             self.module._stop_server()
 
+    def test_cover_proxy_checks_revision_and_supports_independent_audio(self):
+        musicbee = load_script()
+        musicbee._state.update(cover=b'cover fixture', mime='image/png', rev=4)
+        musicbee._start_server(0)
+        self.module._cfg.update(musicbee_port=musicbee._httpd_port, audio_mode='obs', link_colors=True)
+        self.module._start_server(0)
+        base = f'http://127.0.0.1:{self.module._httpd_port}'
+        try:
+            with urlopen(base + '/musicbee-theme.json') as response:
+                self.assertEqual(json.load(response), {'rev': 4, 'has_cover': True})
+            with urlopen(base + '/musicbee-cover?rev=4') as response:
+                self.assertEqual(response.headers.get_content_type(), 'image/png')
+                self.assertEqual(response.read(), b'cover fixture')
+            musicbee._state.update(cover=b'new cover', rev=5)
+            with urlopen(base + '/musicbee-cover?rev=5') as response:
+                self.assertEqual(response.read(), b'new cover')
+            with self.assertRaises(RuntimeError):
+                self.module._musicbee_cover(3)
+            musicbee._state.update(cover=None, rev=6)
+            with urlopen(base + '/musicbee-theme.json') as response:
+                self.assertEqual(json.load(response), {'rev': 6, 'has_cover': False})
+        finally:
+            self.module._stop_server()
+            musicbee._stop_server()
+
 
 if __name__ == '__main__':
     unittest.main()

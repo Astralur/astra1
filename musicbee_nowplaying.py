@@ -30,6 +30,7 @@ import threading
 import time
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlsplit
 
 import obspython as obs
 
@@ -320,7 +321,7 @@ class _SpectrumProcessor:
         limit = self.n - WAVE_POINTS
         crossings = np.flatnonzero((signal[:limit + 1] <= 0) & (signal[1:limit + 2] > 0)) if limit else []
         start = int(crossings[-1]) if len(crossings) else limit
-        self.wave = np.clip(signal[start:start + WAVE_POINTS], -1, 1).round(5).tolist()
+        self.wave = np.clip(signal[start:start + WAVE_POINTS], -1, 1).astype(float).round(5).tolist()
         out = []
         for i, bins in enumerate(self.idx):
             db = 20 * np.log10(float(mag[bins].max()) + 1e-9)
@@ -693,8 +694,10 @@ function setPalette(h,s){
   root.setProperty('--bg',      `hsl(${h} 32% 9%)`);
 }
 function paletteFrom(url){
+  const expectedRev = rev;
   const img = new Image();
   img.onload = () => {
+    if(rev!==expectedRev)return;
     const c = document.createElement('canvas'); c.width = c.height = 32;
     const x = c.getContext('2d'); x.drawImage(img, 0, 0, 32, 32);
     const d = x.getImageData(0, 0, 32, 32).data;
@@ -776,15 +779,21 @@ async function pollBars(){
 if(window.EventSource){const stream=new EventSource('/audio-events');stream.onmessage=e=>{try{const s=JSON.parse(e.data);response=s;real=s.real&&s.enabled;target=real?s.bars:new Array(N).fill(0);}catch(e){real=false;target.fill(0);}};stream.onerror=()=>{real=false;target.fill(0);};}else setInterval(pollBars,16);
 
 const cv = $('wave'), g = cv.getContext('2d');
-let W = 0, H = 0;
+let W = 0, H = 0, gradientKey = "", grad, accentStamp = -1000, a1, a2;
 function resize(){
   const r = cv.getBoundingClientRect(), dpr = window.devicePixelRatio || 1;
   W = r.width; H = r.height; cv.width = W*dpr; cv.height = H*dpr; g.setTransform(dpr,0,0,dpr,0,0);
+  gradientKey = '';
 }
 resize(); addEventListener('resize', resize);
 
-let last = performance.now();
+const FRAME_MS = 1000/60;
+let last = performance.now(), nextDraw = 0;
 function frame(now){
+  requestAnimationFrame(frame);
+  if (now+1 < nextDraw) return;
+  nextDraw = nextDraw ? nextDraw+FRAME_MS : now+FRAME_MS;
+  if (nextDraw < now) nextDraw = now+FRAME_MS;
   const dt = Math.min(.05, (now-last)/1000); last = now;
   if (!W){ resize(); }
   const src = real && playing ? target : new Array(N).fill(0);
@@ -806,10 +815,9 @@ function frame(now){
   const up = pts.map((v,i)=>[xs[i], mid - Math.pow(v,.85)*amp]);
   const dn = pts.map((v,i)=>[xs[i], mid + Math.pow(v,.85)*amp*.85]);
 
-  const cs = getComputedStyle(document.documentElement);
-  const a1 = cs.getPropertyValue('--accent').trim(), a2 = cs.getPropertyValue('--accent2').trim();
-  const grad = g.createLinearGradient(0,0,W,0);
-  grad.addColorStop(0, a1); grad.addColorStop(.5, a2); grad.addColorStop(1, a1);
+  if(now-accentStamp>=250){const cs=getComputedStyle(document.documentElement);a1=cs.getPropertyValue('--accent').trim();a2=cs.getPropertyValue('--accent2').trim();accentStamp=now;}
+  const key = W+','+a1+','+a2;
+  if(key!==gradientKey){grad=g.createLinearGradient(0,0,W,0);grad.addColorStop(0,a1);grad.addColorStop(.5,a2);grad.addColorStop(1,a1);gradientKey=key;}
 
   const path = (arr, rev) => {
     const a = rev ? arr.slice().reverse() : arr;
@@ -830,7 +838,6 @@ function frame(now){
   // linea de brillo superior
   g.beginPath(); g.moveTo(up[0][0], up[0][1]); path(up,false);
   g.strokeStyle = 'rgba(255,255,255,.55)'; g.lineWidth = 1.2; g.stroke();
-  requestAnimationFrame(frame);
 }
 requestAnimationFrame(frame);
 
@@ -874,19 +881,23 @@ def _stream_state(handler, snapshot):
             payload = json.dumps(snapshot(), allow_nan=False, separators=(',', ':')).encode('utf-8')
             handler.wfile.write(b'data: ' + payload + b'\n\n')
             handler.wfile.flush()
-            next_frame = time.monotonic() + 1 / 120
+            next_frame = time.monotonic() + 1 / 60
     except (BrokenPipeError, ConnectionResetError, OSError):
         pass
 
 
 class _Handler(BaseHTTPRequestHandler):
+    disable_nagle_algorithm = True
+
     def log_message(self, *args):
         pass
 
-    def _send(self, code, ctype, body):
+    def _send(self, code, ctype, body, extra_headers=None):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
+        for name, value in (extra_headers or {}).items():
+            self.send_header(name, value)
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
@@ -916,9 +927,9 @@ class _Handler(BaseHTTPRequestHandler):
                 self._send(200, "application/json", json.dumps(payload).encode("utf-8"))
             elif path == "/cover":
                 with _lock:
-                    cover, mime = _state["cover"], _state["mime"]
+                    cover, mime, revision = _state["cover"], _state["mime"], _state["rev"]
                 if cover:
-                    self._send(200, mime, cover)
+                    self._send(200, mime, cover, {"X-Cover-Revision": str(revision)})
                 else:
                     self._send(404, "text/plain", b"sin caratula")
             else:
@@ -954,10 +965,41 @@ def _stop_server():
 
 # ----------------------------------------------------------- fuente de texto ---
 
+def _ensure_browser_fps():
+    """Solo las fuentes de navegador de este overlay, desde el hilo principal de OBS."""
+    with _lock:
+        port = _cfg['port']
+    sources = obs.obs_enum_sources()
+    if not sources:
+        return
+    try:
+        for source in sources:
+            if obs.obs_source_get_unversioned_id(source) != 'browser_source':
+                continue
+            settings = obs.obs_source_get_settings(source)
+            try:
+                try:
+                    url = urlsplit(obs.obs_data_get_string(settings, 'url'))
+                    matches = (url.scheme == 'http' and url.hostname in ('localhost', '127.0.0.1', '::1')
+                               and url.port == port and url.path.rstrip('/') in ('', '/overlay', '/overlay.html'))
+                except ValueError:
+                    matches = False
+                if matches and (not obs.obs_data_get_bool(settings, 'fps_custom')
+                                or obs.obs_data_get_int(settings, 'fps') != 60):
+                    obs.obs_data_set_bool(settings, 'fps_custom', True)
+                    obs.obs_data_set_int(settings, 'fps', 60)
+                    obs.obs_source_update(source, settings)
+            finally:
+                obs.obs_data_release(settings)
+    finally:
+        obs.source_list_release(sources)
+
+
 def _apply():
     """Timer en el hilo principal de OBS."""
     global _last_applied, _last_error
 
+    _ensure_browser_fps()
     with _lock:
         text, error, name = _state["text"], _state["error"], _cfg["source"]
 

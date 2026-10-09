@@ -1,5 +1,6 @@
 """Comprobación opcional en Chromium: presets, controles y audio compartido por SSE."""
 import hashlib
+import base64
 import os
 import sys
 import threading
@@ -57,10 +58,50 @@ try:
         page.locator('#filters button').filter(has_text='Partículas').click()
         assert page.locator('.preset:visible').count() == 3
         page.locator('#filters button').filter(has_text='Todos').click()
+        overlay=browser.new_page(viewport={'width':900,'height':300})
+        overlay.on('pageerror',lambda e:errors.append(str(e)))
+        overlay.goto(base)
+        overlay.wait_for_function('packet.ready && main.level>.1')
         for style in visualizers.PRESETS:
             page.locator(f'.preset[data-style={style}]').click()
+            if style!=visualizers._cfg['style']:
+                page.locator('#use-preset').click()
+            overlay.wait_for_function('(style)=>main.style===style',arg=style)
+            assert visualizers._cfg['style']==style
+            assert page.locator('#preset-url').input_value()==base+'/?style='+style
+            assert page.locator('#open-overlay').get_attribute('href')==base+'/?style='+style
             assert page.evaluate('main.style') == style
             assert page.locator('.preset[aria-pressed=true]').count() == 1
+        def cover(color):
+            fixtures={'#ff0000': 'iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAAKElEQVR4nO3NMQEAAAjDMMC/ZzDBvlRA01vZJvwHAAAAAAAAAAAAbx2jxAE/i2AjOgAAAABJRU5ErkJggg==', '#00ff00': 'iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAAKUlEQVR4nO3NMQEAAAjDMMC/ZzDBvlRA07UVbbJ7AAAAAAAAAAAA8NcBosUBP3JAlsoAAAAASUVORK5CYII='}
+            return base64.b64decode(fixtures[color])
+        with musicbee._lock:
+            musicbee._state.update(active=True,playing=True,title='Color fixture',artist='MusicBee',album='Colors',cover=cover('#ff0000'),mime='image/png',rev=1)
+        music_page=browser.new_page(viewport={'width':640,'height':180})
+        music_page.on('pageerror',lambda e:errors.append(str(e)))
+        music_page.goto(f'http://127.0.0.1:{old_server.server_port}/')
+        music_page.wait_for_function("document.documentElement.style.getPropertyValue('--accent').startsWith('hsl(5 ')")
+        page.locator('#link-colors').check()
+        overlay.wait_for_function("config.link_colors && effectiveConfig().color_a.startsWith('hsl(5 ')")
+        expected=music_page.evaluate("['--accent','--accent2','--bg'].map(key=>document.documentElement.style.getPropertyValue(key))")
+        assert overlay.evaluate('[effectiveConfig().color_a,effectiveConfig().color_b,effectiveConfig().background_color]')==expected
+        with musicbee._lock:
+            musicbee._state.update(cover=cover('#00ff00'),rev=2)
+        music_page.wait_for_function("document.documentElement.style.getPropertyValue('--accent').startsWith('hsl(125 ')")
+        overlay.wait_for_function("effectiveConfig().color_a.startsWith('hsl(125 ')")
+        assert visualizers._cfg['color_a']==0xFFFFE156
+        page.locator('#link-colors').uncheck()
+        overlay.wait_for_function("!config.link_colors && effectiveConfig().color_a==='#56e1ff'")
+        with visualizers._audio_updated:
+            visualizers._cfg.update(link_colors=True,audio_mode='obs')
+            visualizers._audio_seq+=1;visualizers._audio_updated.notify_all()
+        overlay.wait_for_function("config.link_colors && effectiveConfig().color_a.startsWith('hsl(125 ')")
+        with visualizers._audio_updated:
+            visualizers._cfg.update(link_colors=False,audio_mode='musicbee')
+            visualizers._audio_seq+=1;visualizers._audio_updated.notify_all()
+        overlay.wait_for_function('!config.link_colors')
+        music_page.close()
+        overlay.close()
         page.locator('.preset[data-style=ribbon]').click()
         page.evaluate('window.scrollTo(0,0)')
         page.wait_for_timeout(300)
@@ -107,7 +148,7 @@ try:
         assert page.evaluate('Math.max(...main.v)<.001')
         assert not errors, errors
         browser.close()
-    print('PASS: 38 distinct rendered styles; independent attack/release and spatial smoothing; 1024 waveform points; gallery category filters and offscreen rendering; shared MusicBee audio through both actual HTTP servers; gallery selection; silence; gallery-only demo; live style/config changes; transparency/background; density/thickness; responsive canvas; fixed-style URL; disable; no JavaScript errors.')
+    print('PASS: 38 distinct rendered styles; independent attack/release and spatial smoothing; 1024 waveform points; gallery category filters and offscreen rendering; shared MusicBee audio through both actual HTTP servers; all 38 gallery presets applied to actual overlay; preset URLs; MusicBee cover colors and track change; restore manual colors; independent audio color link; silence; gallery-only demo; live style/config changes; transparency/background; density/thickness; responsive canvas; fixed-style URL; disable; no JavaScript errors.')
 finally:
     visualizers._stop.set()
     worker.join(3)

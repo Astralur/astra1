@@ -19,8 +19,8 @@ from urllib.request import build_opener, ProxyHandler
 
 import obspython as obs
 
-BANDS = 64
-WAVE_POINTS = 256
+BANDS = 128
+WAVE_POINTS = 1024
 PRESETS = {
     "bars": "Barras clásicas",
     "mirror": "Barras espejo",
@@ -30,16 +30,50 @@ PRESETS = {
     "orbit": "Anillo fluido",
     "dots": "Barras LED",
     "particles": "Partículas",
+    "bars_peaks": "Barras con picos",
+    "bars_horizontal": "Barras horizontales",
+    "bars_split": "Barras enfrentadas",
+    "bars_edges": "Barras desde los bordes",
+    "bars_center": "Barras hacia el centro",
+    "bars_rounded": "Píldoras",
+    "bars_thin": "Líneas finas",
+    "bars_steps": "Escalones",
+    "ribbon_outline": "Contorno de onda",
+    "ribbon_layers": "Ondas en capas",
+    "ribbon_single": "Montaña de frecuencias",
+    "ribbon_dual": "Ondas cruzadas",
+    "ribbon_tunnel": "Túnel de ondas",
+    "scope_double": "Osciloscopio doble",
+    "scope_fill": "Osciloscopio relleno",
+    "scope_dots": "Osciloscopio punteado",
+    "scope_trail": "Estela de osciloscopio",
+    "scope_xy": "Órbita de la señal",
+    "ring_inward": "Anillo hacia dentro",
+    "ring_double": "Doble anillo",
+    "ring_dots": "Círculo de puntos",
+    "ring_polygon": "Polígono reactivo",
+    "ring_spiral": "Espiral espectral",
+    "ring_flower": "Flor sonora",
+    "ring_sun": "Rayos de sonido",
+    "orbit_radar": "Radar sonoro",
+    "orbit_ripples": "Ecos circulares",
+    "grid_heat": "Mosaico espectral",
+    "particles_fountain": "Fuente de partículas",
+    "particles_constellation": "Constelación"
 }
 _cfg = {
     "audio_mode": "musicbee", "musicbee_port": 8765,
+    "analysis_size": 4096,
     "audio_source": "", "port": 8766, "style": "ribbon",
     "visualizer": True, "normalize": True,
     "color_a": 0xFFFFE156, "color_b": 0xFFFF72AD, "background_color": 0xFF181008,
     "background": False, "glow": True,
-    "intensity": 1.0, "smoothing": .7, "thickness": 3.0, "density": 48,
+    "attack_ms": 18.0, "release_ms": 140.0,
+    "intensity": 1.0, "smoothing": .2, "thickness": 3.0, "density": 48,
 }
 _lock = threading.Lock()
+_audio_updated = threading.Condition(_lock)
+_audio_seq = 0
 _stop = threading.Event()
 _audio_thread = None
 _httpd = None
@@ -51,15 +85,18 @@ _audio = {"bands": [0.0] * BANDS, "wave": [0.0] * WAVE_POINTS, "level": 0.0, "st
 
 
 class _SpectrumProcessor:
-    """AGC RMS solo para las ondas: nivel objetivo, límite de ganancia y puerta de silencio."""
-    def __init__(self, np, rate=44100, n=2048):
+    """PCM continuo, FFT solapada y normalización exclusiva del visualizador."""
+    def __init__(self, np, rate=44100, n=4096):
         self.np, self.rate, self.n = np, rate, n
+        self.hop = 512
         self.win = np.hanning(n).astype(np.float32)[:, None]
         self.buf = np.zeros((n, 2), dtype=np.float32)
         self.gain = None
         self.wave = [0.0] * WAVE_POINTS
         self.level = 0.0
-        edges = np.geomspace(40, min(14000, rate * .49), BANDS + 1)
+        self.processed_frames = 0
+        self.fft_windows = 0
+        edges = np.geomspace(40, min(20000, rate * .49), BANDS + 1)
         freqs = np.fft.rfftfreq(n, 1.0 / rate)
         self.idx = [np.flatnonzero((freqs >= edges[i]) & (freqs < edges[i + 1])) for i in range(BANDS)]
         for i, bins in enumerate(self.idx):
@@ -76,13 +113,15 @@ class _SpectrumProcessor:
     def process(self, data, normalize=True):
         np = self.np
         if not len(data):
+            self.reset()
             return [0.0] * BANDS
         data = np.nan_to_num(np.asarray(data, dtype=np.float32), nan=0, posinf=0, neginf=0)
+        self.processed_frames += len(data)
         if self.buf.shape[1] != data.shape[1]:
             self.buf = np.zeros((self.n, data.shape[1]), dtype=np.float32)
             self.gain = None
         rms = float(np.sqrt(np.mean(data * data)))
-        if rms <= .0001:  # ~-80 dBFS: no convertir ruido o silencio en ondas.
+        if rms <= .0001:
             self.reset()
             return [0.0] * BANDS
         peak = float(np.max(np.abs(data)))
@@ -94,31 +133,33 @@ class _SpectrumProcessor:
         else:
             tau = .05 if desired < self.gain else .6
             self.gain += (desired - self.gain) * (1 - math.exp(-len(data) / self.rate / tau))
-        # Limitar inmediatamente los picos, subir suavemente en pasajes más bajos.
         if normalize:
             self.gain = min(self.gain, .98 / peak)
-        samples = data[-self.n:] * self.gain
-        count = len(samples)
-        self.buf[:-count] = self.buf[count:]
-        self.buf[-count:] = samples
+        samples = data * self.gain
         self.level = min(1.0, float(np.sqrt(np.mean(samples * samples))) * 4)
-        # Osciloscopio real: canal con más energía, ventana alineada al cruce por cero.
+        mag = np.zeros(self.n // 2 + 1, dtype=np.float32)
+        # Analizar TODOS los bloques recibidos, no únicamente la cola de la señal.
+        # Se conservan los picos entre ventanas del mismo lote para no perder ataques.
+        for offset in range(0, len(samples), self.hop):
+            block = samples[offset:offset + self.hop]
+            count = len(block)
+            self.buf[:-count] = self.buf[count:]
+            self.buf[-count:] = block
+            fft = np.fft.rfft(self.buf * self.win, axis=0)
+            current = np.sqrt(np.mean(np.abs(fft) ** 2, axis=1)) / (self.n / 4)
+            np.maximum(mag, current, out=mag)
+            self.fft_windows += 1
+        # Enviar 1024 muestras reales, sin interpolarlas desde una onda pequeña.
         channel = int(np.argmax(np.mean(self.buf * self.buf, axis=0)))
         signal = self.buf[:, channel]
-        length = min(768, self.n)
-        limit = self.n - length
-        crossings = np.flatnonzero((signal[:limit + 1] <= 0) & (signal[1:limit + 2] > 0))
+        limit = self.n - WAVE_POINTS
+        crossings = np.flatnonzero((signal[:limit + 1] <= 0) & (signal[1:limit + 2] > 0)) if limit else []
         start = int(crossings[-1]) if len(crossings) else limit
-        window = signal[start:start + length]
-        self.wave = np.clip(np.interp(np.linspace(0, length - 1, WAVE_POINTS),
-                                     np.arange(length), window), -1, 1).round(4).tolist()
-        # Energía de ambos canales: una señal estéreo en contrafase no desaparece.
-        fft = np.fft.rfft(self.buf * self.win, axis=0)
-        mag = np.sqrt(np.mean(np.abs(fft) ** 2, axis=1)) / (self.n / 4)
+        self.wave = np.clip(signal[start:start + WAVE_POINTS], -1, 1).round(5).tolist()
         out = []
         for i, bins in enumerate(self.idx):
             db = 20 * np.log10(float(mag[bins].max()) + 1e-9)
-            out.append(round(min(1.0, max(0.0, (db + 72) / 52 + self.tilt[i])), 3))
+            out.append(round(min(1.0, max(0.0, (db + 72) / 52 + self.tilt[i])), 4))
         return out
 
 
@@ -183,7 +224,8 @@ class _ObsAudioTap:
         self.active = False
         self.registered = False
         self.error = None
-        self.packets = queue.Queue(maxsize=4)
+        self.packets = queue.Queue(maxsize=32)
+        self.dropped_packets = 0
         self.callback = _AUDIO_CALLBACK(self._capture)
         self.rate, self.channels = api.audio_info()
         try:
@@ -203,7 +245,7 @@ class _ObsAudioTap:
 
     def _capture(self, _, source, audio, muted):
         # No ejecutar FFT ni llamar a OBS desde su hilo de audio. Copiar antes
-        # de que OBS reutilice los buffers; la cola descarta audio antiguo.
+        # de que OBS reutilice los buffers; descartar solo si se llena la cola.
         if not self.active or source != self.source or not audio:
             return
         try:
@@ -219,6 +261,7 @@ class _ObsAudioTap:
             except queue.Full:
                 try:
                     self.packets.get_nowait()
+                    self.dropped_packets += 1
                 except queue.Empty:
                     pass
                 try:
@@ -229,16 +272,21 @@ class _ObsAudioTap:
             self.error = str(e)
 
     def read(self, np):
-        planes = self.packets.get(timeout=.05)
-        # Usar el paquete más reciente para mantener baja la latencia.
+        pending = [self.packets.get(timeout=.025)]
         while True:
             try:
-                planes = self.packets.get_nowait()
+                pending.append(self.packets.get_nowait())
             except queue.Empty:
                 break
-        if planes is None:
-            return None  # Fuente silenciada.
-        return np.column_stack([np.frombuffer(p, dtype=np.float32) for p in planes])
+        # El silencio explícito marca una discontinuidad. Conservar toda la señal
+        # posterior a ella, en lugar de descartar cada paquete salvo el último.
+        if pending[-1] is None:
+            return None
+        last_mute = max((i for i, planes in enumerate(pending) if planes is None), default=-1)
+        chunks = [np.column_stack([np.frombuffer(p, dtype=np.float32) for p in planes])
+                  for planes in pending[last_mute + 1:]]
+        return np.concatenate(chunks, axis=0)
+
 
     def close(self):
         self.active = False
@@ -250,12 +298,14 @@ class _ObsAudioTap:
             self.source = None
 
 
-def _publish_audio(bars, ready=False, source='', error=None, wave=None, level=0.0):
-    global _audio_ok, _audio_source_name, _audio_error
-    with _lock:
+def _publish_audio(bars, ready=False, source='', error=None, wave=None, level=0.0, analysis=None):
+    global _audio_ok, _audio_source_name, _audio_error, _audio_seq
+    with _audio_updated:
         _audio_ok, _audio_source_name, _audio_error = ready, source, error
         _audio.update(bands=list(bars), wave=list(wave) if wave is not None else [0.0] * WAVE_POINTS,
-                      level=level, stamp=time.monotonic())
+                      level=level, stamp=time.monotonic(), analysis=dict(analysis or {}))
+        _audio_seq += 1
+        _audio_updated.notify_all()
 
 
 _local_http = build_opener(ProxyHandler({}))
@@ -268,7 +318,10 @@ def _read_musicbee(port):
         raw = response.read(65537)
     if len(raw) > 65536:
         raise RuntimeError('La respuesta de MusicBee es demasiado grande.')
-    data = json.loads(raw)
+    _consume_musicbee(json.loads(raw))
+
+
+def _consume_musicbee(data):
     source = str(data.get('source') or 'MusicBee')[:256]
     age = float(data.get('age', 0))
     if not math.isfinite(age):
@@ -285,7 +338,24 @@ def _read_musicbee(port):
             raise RuntimeError('MusicBee devolvió muestras de audio no válidas.')
         return [min(high, max(low, v)) for v in out]
     level = numbers([data.get('level', 0)], 0, 1)[0]
-    _publish_audio(numbers(bands, 0, 1), True, source, wave=numbers(wave, -1, 1), level=level)
+    _publish_audio(numbers(bands, 0, 1), True, source, wave=numbers(wave, -1, 1), level=level, analysis=data.get("analysis", {}))
+
+
+def _stream_musicbee(port):
+    if port == _httpd_port:
+        raise RuntimeError("El puerto de MusicBee debe ser distinto del puerto de visualizadores.")
+    with _local_http.open(f"http://127.0.0.1:{port}/audio-events", timeout=.75) as response:
+        while not _stop.is_set():
+            with _lock:
+                if not _cfg["visualizer"] or _cfg["audio_mode"] != "musicbee" or _cfg["musicbee_port"] != port:
+                    return
+            line = response.readline(65537)
+            if not line:
+                raise RuntimeError("Se ha interrumpido la conexión de audio con MusicBee.")
+            if len(line) > 65536:
+                raise RuntimeError("La respuesta de MusicBee es demasiado grande.")
+            if line.startswith(b"data: "):
+                _consume_musicbee(json.loads(line[6:]))
 
 
 def _audio_worker():
@@ -299,6 +369,7 @@ def _audio_worker():
                 with _lock:
                     enabled, requested, normalize = _cfg['visualizer'], _cfg['audio_source'], _cfg['normalize']
                     mode, musicbee_port = _cfg['audio_mode'], _cfg['musicbee_port']
+                    analysis_size = _cfg['analysis_size']
                 if not enabled:
                     if tap:
                         tap.close()
@@ -310,9 +381,8 @@ def _audio_worker():
                     if tap:
                         tap.close()
                         tap = None
-                    _read_musicbee(musicbee_port)
+                    _stream_musicbee(musicbee_port)
                     last_error = None
-                    _stop.wait(1 / 30)
                     continue
                 if not requested:
                     if tap:
@@ -330,9 +400,11 @@ def _audio_worker():
                     tap = None
                 if tap is None:
                     tap = _ObsAudioTap(api, requested)
-                    processor = _SpectrumProcessor(np, rate=tap.rate)
+                    processor = _SpectrumProcessor(np, rate=tap.rate, n=analysis_size)
                     last_packet = inspected = time.monotonic()
                     _publish_audio(zero, source=requested)
+                if processor.n != analysis_size:
+                    processor = _SpectrumProcessor(np, rate=tap.rate, n=analysis_size)
                 now = time.monotonic()
                 if now - inspected >= .5:
                     if api.obs_source_removed(tap.source):
@@ -356,7 +428,10 @@ def _audio_worker():
                     bars = zero
                 else:
                     bars = processor.process(data, normalize=normalize)
-                _publish_audio(bars, True, requested, wave=processor.wave, level=processor.level)
+                _publish_audio(bars, True, requested, wave=processor.wave, level=processor.level,
+                               analysis={"sample_rate": tap.rate, "fft_size": processor.n,
+                                         "processed_frames": processor.processed_frames,
+                                         "fft_windows": processor.fft_windows, "dropped_packets": tap.dropped_packets})
                 last_packet = time.monotonic()
                 last_error = None
             except Exception as e:
@@ -384,7 +459,7 @@ OVERLAY_HTML = r"""<!doctype html>
 :root{color-scheme:dark;--a:#56e1ff;--b:#ad72ff;--text:#edf4fa;--muted:#9faec2;--line:rgba(255,255,255,.1)}
 *{box-sizing:border-box}html,body{margin:0;width:100%;height:100%;background:transparent;font-family:system-ui,"Segoe UI",sans-serif;color:var(--text)}
 body{overflow:hidden}button{font:inherit}#app,.hero{width:100%;height:100%}canvas{display:block;width:100%;height:100%}
-header,.hero-bar,.grid,footer{display:none}
+header,.hero-bar,.grid,footer,.filters{display:none}
 body.gallery{background:#0b1020;overflow:auto;height:auto;min-height:100vh;
  background-image:radial-gradient(ellipse at 8% 0%,rgba(86,225,255,.08),transparent 45%),radial-gradient(ellipse at 100% 50%,rgba(173,114,255,.08),transparent 45%)}
 .gallery #app{max-width:1240px;height:auto;margin:auto;padding:30px}
@@ -397,6 +472,7 @@ h1{font-size:30px;line-height:1.1;letter-spacing:-.04em;margin:0}header p{font-s
 .gallery .hero-bar{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:16px 20px;border-bottom:1px solid rgba(255,255,255,.05)}
 .hero-title{font-size:14px;font-weight:600}#signal{font-size:11px;color:var(--muted)}#signal.demo-on{color:#ffcb78}
 .gallery #main{height:220px}
+.gallery .filters{display:flex;gap:8px;flex-wrap:wrap;margin-top:18px}.filters button{padding:8px 13px;border:1px solid var(--line);border-radius:999px;background:transparent;color:var(--muted);font-size:12px;cursor:pointer}.filters button[aria-pressed=true]{background:rgba(86,225,255,.1);border-color:var(--a);color:var(--text)}
 .gallery .grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-top:18px}
 .preset{text-align:left;color:var(--text);border:1px solid var(--line);border-radius:14px;padding:0;overflow:hidden;
  background:rgba(10,17,32,.75);cursor:pointer;transition:border-color .2s,background .2s;min-width:0}
@@ -409,40 +485,44 @@ h1{font-size:30px;line-height:1.1;letter-spacing:-.04em;margin:0}header p{font-s
 @media(max-width:440px){.gallery header{flex-direction:column}.gallery .hero-bar{align-items:flex-start;flex-direction:column}.gallery #main{height:180px}}
 </style></head>
 <body><main id="app">
-<header><div><p class="kicker">AUDIO / OBS</p><h1>Encuentra tu ritmo.</h1><p>Ocho formas de ver la misma música. Elige la que más te guste.</p></div>
+<header><div><p class="kicker">AUDIO / OBS</p><h1>Encuentra tu ritmo.</h1><p>38 formas de ver la misma música. Elige la que más te guste.</p></div>
 <label class="demo"><input id="demo" type="checkbox">Comparar con demostración</label></header>
 <section class="hero"><div class="hero-bar"><span class="hero-title" id="selected">Ondas suaves</span><span id="signal">Esperando audio de MusicBee</span></div><canvas id="main" aria-label="Visualizador de audio"></canvas></section>
+<nav class="filters" id="filters" aria-label="Filtrar estilos"></nav>
 <section class="grid" id="grid" aria-label="Estilos de visualizador"></section>
 <footer>Para usar tu elección, selecciona <strong id="choice-label">Ondas suaves</strong> en <strong>Estilo</strong>, en las propiedades del script de OBS. La demostración solo se muestra en esta galería.</footer>
 </main>
 <script>
-const STYLES={bars:'Barras clásicas',mirror:'Barras espejo',ribbon:'Ondas suaves',scope:'Osciloscopio',ring:'Espectro circular',orbit:'Anillo fluido',dots:'Barras LED',particles:'Partículas'};
+const STYLES={"bars":"Barras clásicas","mirror":"Barras espejo","ribbon":"Ondas suaves","scope":"Osciloscopio","ring":"Espectro circular","orbit":"Anillo fluido","dots":"Barras LED","particles":"Partículas","bars_peaks":"Barras con picos","bars_horizontal":"Barras horizontales","bars_split":"Barras enfrentadas","bars_edges":"Barras desde los bordes","bars_center":"Barras hacia el centro","bars_rounded":"Píldoras","bars_thin":"Líneas finas","bars_steps":"Escalones","ribbon_outline":"Contorno de onda","ribbon_layers":"Ondas en capas","ribbon_single":"Montaña de frecuencias","ribbon_dual":"Ondas cruzadas","ribbon_tunnel":"Túnel de ondas","scope_double":"Osciloscopio doble","scope_fill":"Osciloscopio relleno","scope_dots":"Osciloscopio punteado","scope_trail":"Estela de osciloscopio","scope_xy":"Órbita de la señal","ring_inward":"Anillo hacia dentro","ring_double":"Doble anillo","ring_dots":"Círculo de puntos","ring_polygon":"Polígono reactivo","ring_spiral":"Espiral espectral","ring_flower":"Flor sonora","ring_sun":"Rayos de sonido","orbit_radar":"Radar sonoro","orbit_ripples":"Ecos circulares","grid_heat":"Mosaico espectral","particles_fountain":"Fuente de partículas","particles_constellation":"Constelación"};
 const gallery=location.pathname.replace(/\/$/,'')==='/compare';
 if(gallery)document.body.classList.add('gallery');
 const queryStyle=new URLSearchParams(location.search).get('style');
 let selection=STYLES[queryStyle]?queryStyle:'ribbon', clicked=false;
-let config={style:'ribbon',color_a:'#56e1ff',color_b:'#ad72ff',background_color:'#081018',background:false,glow:true,intensity:1,smoothing:.7,thickness:3,density:48};
-let packet={bands:new Array(64).fill(0),wave:new Array(256).fill(0),level:0,ready:false,source:'',error:null};
+let config={style:'ribbon',color_a:'#56e1ff',color_b:'#ad72ff',background_color:'#081018',background:false,glow:true,intensity:1,smoothing:.2,attack_ms:18,release_ms:140,thickness:3,density:64};
+let packet={bands:new Array(128).fill(0),wave:new Array(1024).fill(0),level:0,ready:false,source:'',error:null};
 let received=0, demo=false;
 const clamp=(v,a=0,b=1)=>Math.min(b,Math.max(a,Number.isFinite(v)?v:0));
 function resample(values,n){const last=values.length-1;return Array.from({length:n},(_,i)=>{const p=i*last/(n-1),j=Math.floor(p);return (values[j]||0)*(1-p+j)+(values[Math.min(last,j+1)]||0)*(p-j)});}
 function curve(g,points){g.moveTo(...points[0]);for(let i=1;i<points.length-1;i++){g.quadraticCurveTo(...points[i],(points[i][0]+points[i+1][0])/2,(points[i][1]+points[i+1][1])/2);}g.lineTo(...points[points.length-1]);}
 function rounded(g,x,y,w,h,r){r=Math.min(r,w/2,h/2);g.beginPath();g.moveTo(x+r,y);g.arcTo(x+w,y,x+w,y+h,r);g.arcTo(x+w,y+h,x,y+h,r);g.arcTo(x,y+h,x,y,r);g.arcTo(x,y,x+w,y,r);g.closePath();g.fill();}
 class Visualizer{
- constructor(canvas,style){this.canvas=canvas;this.g=canvas.getContext('2d');this.style=style;this.v=new Array(64).fill(0);this.wave=new Array(256).fill(0);this.level=0;this.phase=0;this.w=0;this.h=0;this.key='';this.observer=new ResizeObserver(()=>this.resize());this.observer.observe(canvas);this.resize();}
+ constructor(canvas,style){this.canvas=canvas;this.g=canvas.getContext('2d');this.style=style;this.v=new Array(128).fill(0);this.wave=new Array(1024).fill(0);this.waveReference=.48;this.peaks=new Array(128).fill(0);this.trails=[];this.ripples=[];this.lastBass=0;this.visible=!gallery;this.level=0;this.phase=0;this.w=0;this.h=0;this.key='';this.observer=new ResizeObserver(()=>this.resize());this.observer.observe(canvas);this.resize();if(gallery){this.visibility=new IntersectionObserver(entries=>{this.visible=entries[0].isIntersecting;},{rootMargin:"100px"});this.visibility.observe(canvas);}}
  resize(){const r=this.canvas.getBoundingClientRect();this.w=r.width;this.h=r.height;const d=Math.min(window.devicePixelRatio||1,gallery?1.5:2);this.canvas.width=Math.round(this.w*d);this.canvas.height=Math.round(this.h*d);this.g.setTransform(d,0,0,d,0,0);this.key='';}
  draw(data,dt,c){
-  const {g,w,h}=this;if(!w||!h)return;
-  const live=data.ready, bands=live?resample(data.bands,64):new Array(64).fill(0), wave=live?resample(data.wave,256):new Array(256).fill(0);
-  const smooth=clamp(c.smoothing), attack=1-Math.exp(-dt*(50-35*smooth)),release=1-Math.exp(-dt*(28-23*smooth));
-  for(let i=0;i<64;i++){const t=clamp(bands[i]);this.v[i]+=(t-this.v[i])*(t>this.v[i]?attack:release);}
-  for(let i=0;i<256;i++)this.wave[i]+=(clamp(wave[i],-1,1)-this.wave[i])*(1-Math.exp(-dt*45));
-  this.level+=(clamp(live?data.level:0)-this.level)*attack;this.phase+=dt*this.level*.6;
+  const {g,w,h}=this;if(!w||!h||!this.visible)return;
+  const live=data.ready, bands=live?resample(data.bands,128):new Array(128).fill(0), wave=live?resample(data.wave,1024):new Array(1024).fill(0);
+  const smooth=clamp(c.smoothing), attack=c.attack_ms>0?1-Math.exp(-dt*1000/c.attack_ms):1,release=c.release_ms>0?1-Math.exp(-dt*1000/c.release_ms):1;
+  for(let i=0;i<128;i++){const t=clamp(bands[i]);this.v[i]+=(t-this.v[i])*(t>this.v[i]?attack:release);this.peaks[i]=Math.max(this.v[i],this.peaks[i]*Math.exp(-dt*2));}
+  const rawLevel=clamp(live?data.level:0);this.level+=(rawLevel-this.level)*(rawLevel>this.level?attack:release);
+  if(live&&rawLevel>.00001){this.wave=wave;this.waveReference=rawLevel;}
+  const waveScale=Math.min(2,this.level/Math.max(.00001,this.waveReference));
+  const waveSignal=this.wave.map((v,i)=>v*(1-smooth)+smooth*((this.wave[Math.max(0,i-1)]+2*v+this.wave[Math.min(1023,i+1)])/4));
+  this.phase+=dt*this.level*.6;
   g.clearRect(0,0,w,h);g.globalAlpha=1;g.lineCap='round';g.lineJoin='round';
   const key=`${w},${h},${c.color_a},${c.color_b}`;if(key!==this.key){this.gradient=g.createLinearGradient(w*.08,h,w*.92,0);this.gradient.addColorStop(0,c.color_a);this.gradient.addColorStop(1,c.color_b);this.key=key;}
   g.fillStyle=g.strokeStyle=this.gradient;g.shadowColor=c.color_a;g.shadowBlur=c.glow?Math.min(18,h*.08):0;g.lineWidth=c.thickness;
-  const n=Math.round(clamp(c.density,16,96)), values=resample(this.v,n).map(v=>clamp(v*c.intensity)), pad=w*.07, width=w-2*pad;
-  const mirrored=()=>{const half=resample(this.v,Math.ceil(n/2)).map(v=>clamp(v*c.intensity));return half.slice().reverse().concat(half);};
+  const n=Math.round(clamp(c.density,16,256)), values=resample(this.v.map((v,i)=>v*(1-smooth)+smooth*(this.v[Math.max(0,i-1)]+2*v+this.v[Math.min(127,i+1)])/4),n).map(v=>clamp(v*c.intensity)), pad=w*.07, width=w-2*pad;
+  const mirrored=()=>{const half=resample(values,Math.ceil(n/2));return half.slice().reverse().concat(half);};
   if(this.style==='bars'||this.style==='mirror'){
    const vals=this.style==='mirror'?mirrored():values;const step=width/vals.length,bw=Math.max(1,step*.68);
    vals.forEach((v,i)=>{const size=Math.max(1.5,v*h*(this.style==='mirror'?.36:.72));const y=this.style==='mirror'?h/2-size:h*.86-size;rounded(g,pad+i*step,y,bw,this.style==='mirror'?2*size:size,Math.min(3,bw/2));});
@@ -452,8 +532,8 @@ class Visualizer{
    g.beginPath();curve(g,top);g.lineTo(...bottom[0]);for(let i=1;i<bottom.length-1;i++)g.quadraticCurveTo(...bottom[i],(bottom[i][0]+bottom[i+1][0])/2,(bottom[i][1]+bottom[i+1][1])/2);g.lineTo(...bottom[bottom.length-1]);g.closePath();g.globalAlpha=.85;g.fill();g.globalAlpha=1;
    g.beginPath();curve(g,top);g.strokeStyle='rgba(255,255,255,.65)';g.lineWidth=Math.max(1,c.thickness*.4);g.stroke();
   }else if(this.style==='scope'){
-   const pts=this.wave.map((v,i)=>[pad+i*width/255,h/2-clamp(v*3.5*c.intensity,-1,1)*h*.38]);
-   g.beginPath();curve(g,pts);g.stroke();
+   const pts=waveSignal.map((v,i)=>[pad+i*width/1023,h/2-clamp(v*3.5*c.intensity*waveScale,-1,1)*h*.38]);
+   g.beginPath();g.moveTo(...pts[0]);for(let i=1;i<pts.length;i++)g.lineTo(...pts[i]);g.stroke();
   }else if(this.style==='ring'){
    const radius=Math.min(w,h)*.27,cx=w/2,cy=h/2;g.globalAlpha=.18;g.beginPath();g.arc(cx,cy,radius,0,Math.PI*2);g.stroke();g.globalAlpha=1;
    values.forEach((v,i)=>{const a=i/n*Math.PI*2-Math.PI/2,extent=radius+v*Math.min(w,h)*.18;g.lineWidth=Math.max(1,Math.min(c.thickness+1,radius*4/n));g.beginPath();g.moveTo(cx+Math.cos(a)*radius,cy+Math.sin(a)*radius);g.lineTo(cx+Math.cos(a)*extent,cy+Math.sin(a)*extent);g.stroke();});
@@ -467,6 +547,85 @@ class Visualizer{
    const size=Math.min(w,h),cx=w/2,cy=h/2;
    for(let i=0;i<96;i++){const v=values[i%n];if(v<.01)continue;const angle=i*2.399963+this.phase*((i%2)?1:-1),rad=size*(.06+.3*Math.sqrt((i+.5)/96))*(.65+.55*v);
     const x=cx+Math.cos(angle)*rad*(w>h?Math.min(2,w/h):1),y=cy+Math.sin(angle)*rad;g.globalAlpha=clamp(v*.95);g.beginPath();g.arc(x,y,Math.max(.7,(1+i%4)*v*size*.012),0,Math.PI*2);g.fill();}g.globalAlpha=1;
+  }else if(this.style.startsWith('bars_')){
+   const step=width/n,bw=Math.max(1,step*.65),mid=h/2;
+   if(this.style==='bars_horizontal'){
+    const count=Math.min(n,24),vals=resample(values,count),dy=h*.8/count;
+    vals.forEach((v,i)=>rounded(g,pad,h*.1+i*dy,Math.max(2,v*width),dy*.55,dy*.25));
+   }else if(this.style==='bars_split'){
+    const count=Math.min(n,32),vals=resample(values,count),dy=h*.8/count;
+    vals.forEach((v,i)=>{const len=Math.max(1,v*width*.43),y=h*.1+i*dy;rounded(g,w/2-len-3,y,len,dy*.65,2);rounded(g,w/2+3,y,len,dy*.65,2);});
+   }else if(this.style==='bars_center'){
+    values.forEach((v,i)=>{const len=Math.max(2,v*h*.38),x=pad+i*step;rounded(g,x,mid-len,bw,len*2,bw/2);g.globalAlpha=.22;g.beginPath();g.arc(x+bw/2,mid,bw,0,Math.PI*2);g.fill();g.globalAlpha=1;});
+   }else if(this.style==='bars_edges'){
+    values.forEach((v,i)=>{const len=Math.max(1,v*h*.36),x=pad+i*step;rounded(g,x,h*.07,bw,len,2);rounded(g,x,h*.93-len,bw,len,2);});
+   }else if(this.style==='bars_steps'){
+    const rows=18,dy=h*.75/rows;
+    values.forEach((v,i)=>{for(let j=0;j<Math.round(v*rows);j++)rounded(g,pad+i*step,h*.88-(j+1)*dy,bw,dy*.65,1);});
+   }else{
+    const vals=this.style==='bars_rounded'?resample(values,Math.min(n,24)):values,dx=width/vals.length;
+    vals.forEach((v,i)=>{const len=Math.max(2,v*h*.72),barw=this.style==='bars_thin'?Math.min(2,dx*.3):dx*(this.style==='bars_rounded'?.78:.65);
+     rounded(g,pad+i*dx,h*.86-len,barw,len,this.style==='bars_rounded'?barw/2:2);
+     if(this.style==='bars_peaks'){const peak=resample(this.peaks,vals.length)[i];g.globalAlpha=.8;rounded(g,pad+i*dx,h*.86-clamp(peak*c.intensity)*h*.72-4,barw,2,1);g.globalAlpha=1;}
+    });
+   }
+  }else if(this.style.startsWith('ribbon_')){
+   const vals=this.style==='ribbon_single'?values:mirrored(),step=width/(vals.length-1),mid=h/2;
+   if(this.style==='ribbon_single'){
+    const pts=vals.map((v,i)=>[pad+i*step,h*.84-v*h*.65]);g.beginPath();curve(g,pts);g.lineTo(w-pad,h*.84);g.lineTo(pad,h*.84);g.closePath();g.globalAlpha=.75;g.fill();g.globalAlpha=1;g.beginPath();curve(g,pts);g.stroke();
+   }else if(this.style==='ribbon_dual'){
+    for(const sign of [-1,1]){const pts=vals.map((v,i)=>[pad+i*step,mid+sign*v*h*.3]);g.beginPath();curve(g,pts);g.stroke();}
+    g.globalAlpha=.25;g.beginPath();curve(g,vals.map((v,i)=>[pad+i*step,mid+(v-.3)*h*.3]));g.stroke();g.globalAlpha=1;
+   }else{
+    const layers=this.style==='ribbon_outline'?1:this.style==='ribbon_tunnel'?7:4;
+    for(let layer=layers-1;layer>=0;layer--){const factor=this.style==='ribbon_tunnel'?(layer+1)/layers:1-layer*.16,offset=this.style==='ribbon_layers'?layer*h*.05:0;
+     const top=vals.map((v,i)=>[pad+i*step,mid-offset-v*h*.3*factor]);const bottom=vals.map((v,i)=>[pad+i*step,mid-offset+v*h*.27*factor]).reverse();
+     g.beginPath();curve(g,top);g.lineTo(...bottom[0]);for(let i=1;i<bottom.length;i++)g.lineTo(...bottom[i]);g.closePath();g.globalAlpha=layer===0?1:.22;
+     if(this.style==='ribbon_layers'){g.globalAlpha=.16+(.18*(layers-layer));g.fill();}g.stroke();
+    }g.globalAlpha=1;
+   }
+  }else if(this.style.startsWith('scope_')){
+   const amplitude=h*.34,pts=waveSignal.map((v,i)=>[pad+i*width/(waveSignal.length-1),h/2-v*3.5*c.intensity*waveScale*amplitude]);
+   const line=points=>{g.beginPath();g.moveTo(...points[0]);for(let i=1;i<points.length;i++)g.lineTo(...points[i]);g.stroke();};
+   if(this.style==='scope_fill'){g.beginPath();g.moveTo(...pts[0]);for(let i=1;i<pts.length;i++)g.lineTo(...pts[i]);g.lineTo(w-pad,h/2);g.lineTo(pad,h/2);g.closePath();g.globalAlpha=.35;g.fill();g.globalAlpha=1;line(pts);
+   }else if(this.style==='scope_double'){for(const sign of [-1,1])line(pts.map(([x,y])=>[x,h/2+sign*(y-h/2)*.65+sign*h*.17]));
+   }else if(this.style==='scope_dots'){for(let i=0;i<pts.length;i+=Math.max(1,Math.round(pts.length/n))){g.beginPath();g.arc(...pts[i],Math.max(1,c.thickness),0,Math.PI*2);g.fill();}
+   }else if(this.style==='scope_trail'){this.trails.push({points:pts,age:0});if(this.trails.length>12)this.trails.shift();for(const trail of this.trails){trail.age+=dt;g.globalAlpha=Math.max(0,1-trail.age/.4)*.45;line(trail.points);}g.globalAlpha=1;line(pts);
+   }else if(this.style==='scope_xy'){const size=Math.min(w,h),rad=size*.27;g.beginPath();for(let i=0;i<waveSignal.length;i++){const a=i/waveSignal.length*Math.PI*2,rr=rad+waveSignal[i]*3*c.intensity*waveScale*size*.12;const x=w/2+Math.cos(a)*rr,y=h/2+Math.sin(a)*rr;i?g.lineTo(x,y):g.moveTo(x,y);}g.closePath();g.stroke();}
+  }else if(this.style.startsWith('ring_')){
+   const size=Math.min(w,h),rad=size*.27,cx=w/2,cy=h/2;
+   if(this.style==='ring_dots'){
+    values.forEach((v,i)=>{const a=i/n*Math.PI*2-Math.PI/2,r=rad+v*size*.09;g.globalAlpha=.2+.8*v;g.beginPath();g.arc(cx+Math.cos(a)*r,cy+Math.sin(a)*r,Math.max(1,c.thickness+v*5),0,Math.PI*2);g.fill();});g.globalAlpha=1;
+   }else if(this.style==='ring_polygon'){
+    const vals=resample(values,8),pts=vals.map((v,i)=>{const a=i/8*Math.PI*2-Math.PI/2,r=rad+v*size*.13;return[cx+Math.cos(a)*r,cy+Math.sin(a)*r];});g.beginPath();g.moveTo(...pts[0]);for(let i=1;i<pts.length;i++)g.lineTo(...pts[i]);g.closePath();g.globalAlpha=.18;g.fill();g.globalAlpha=1;g.stroke();
+   }else if(this.style==='ring_spiral'){
+    const vals=resample(values,n*3);g.beginPath();vals.forEach((v,i)=>{const a=i/vals.length*Math.PI*6+this.phase,r=size*(.04+i/vals.length*.31+v*.05),x=cx+Math.cos(a)*r,y=cy+Math.sin(a)*r;i?g.lineTo(x,y):g.moveTo(x,y);});g.stroke();
+   }else if(this.style==='ring_flower'){
+    const pts=values.map((v,i)=>{const a=i/n*Math.PI*2,r=rad+v*size*.07+Math.sin(a*6)*this.level*size*.16;return[cx+Math.cos(a)*r,cy+Math.sin(a)*r];});pts.push(pts[0],pts[1]);g.beginPath();curve(g,pts);g.closePath();g.globalAlpha=.14;g.fill();g.globalAlpha=1;g.stroke();
+   }else{
+    values.forEach((v,i)=>{const a=i/n*Math.PI*2-Math.PI/2,inner=this.style==='ring_inward'?rad-v*size*.19:rad,outer=this.style==='ring_inward'?rad:rad+v*size*.17;
+     g.beginPath();g.moveTo(cx+Math.cos(a)*inner,cy+Math.sin(a)*inner);g.lineTo(cx+Math.cos(a)*outer,cy+Math.sin(a)*outer);g.stroke();
+     if(this.style==='ring_double'){g.globalAlpha=.6;g.beginPath();g.moveTo(cx+Math.cos(a)*rad*.65,cy+Math.sin(a)*rad*.65);g.lineTo(cx+Math.cos(a)*(rad*.65-v*size*.13),cy+Math.sin(a)*(rad*.65-v*size*.13));g.stroke();g.globalAlpha=1;}
+     if(this.style==='ring_sun'){g.beginPath();g.moveTo(cx+Math.cos(a)*rad*.25,cy+Math.sin(a)*rad*.25);g.lineTo(cx+Math.cos(a)*outer,cy+Math.sin(a)*outer);g.globalAlpha=.2+.6*v;g.stroke();g.globalAlpha=1;}
+    });
+    g.globalAlpha=.3;g.beginPath();g.arc(cx,cy,rad,0,Math.PI*2);g.stroke();g.globalAlpha=1;
+   }
+  }else if(this.style==='orbit_radar'){
+   const size=Math.min(w,h),rad=size*.35;g.globalAlpha=.1;for(let i=1;i<=3;i++){g.beginPath();g.arc(w/2,h/2,rad*i/3,0,Math.PI*2);g.stroke();}g.globalAlpha=1;
+   resample(values,24).forEach((v,i)=>{const a=i/24*Math.PI*2+this.phase;g.globalAlpha=.2+.8*v;g.beginPath();g.moveTo(w/2,h/2);g.lineTo(w/2+Math.cos(a)*rad*v,h/2+Math.sin(a)*rad*v);g.stroke();});g.globalAlpha=1;
+  }else if(this.style==='orbit_ripples'){
+   const bass=this.v.slice(0,12).reduce((a,b)=>a+b,0)/12;if(bass>this.lastBass+.025&&bass>.15)this.ripples.push({radius:.05,alpha:bass});this.lastBass=bass;
+   if(this.ripples.length>12)this.ripples.shift();for(const ripple of this.ripples){ripple.radius+=dt*.22;ripple.alpha-=dt*.7;g.globalAlpha=Math.max(0,ripple.alpha);g.beginPath();g.arc(w/2,h/2,Math.min(w,h)*ripple.radius,0,Math.PI*2);g.stroke();}
+   this.ripples=this.ripples.filter(r=>r.alpha>0);g.globalAlpha=.3+this.level;g.beginPath();g.arc(w/2,h/2,Math.min(w,h)*(.13+.06*this.level),0,Math.PI*2);g.stroke();g.globalAlpha=1;
+  }else if(this.style==='grid_heat'){
+   const cols=16,rows=8,dx=width/cols,dy=h*.76/rows;
+   resample(values,cols*rows).forEach((v,i)=>{g.globalAlpha=.04+.9*v;rounded(g,pad+(i%cols)*dx,h*.12+Math.floor(i/cols)*dy,dx*.8,dy*.8,Math.min(dx,dy)*.12);});g.globalAlpha=1;
+  }else if(this.style==='particles_fountain'){
+   const vals=resample(values,64);
+   vals.forEach((v,i)=>{if(v<.02)return;const travel=(this.phase*(.7+i%5*.1)+i*.618)%1,x=pad+width*i/63+Math.sin(i*1.8)*width*.03*travel,y=h*.86-travel*h*.7*v;g.globalAlpha=v*(1-travel*.6);g.beginPath();g.arc(x,y,Math.max(1,c.thickness*.5+v*4),0,Math.PI*2);g.fill();});g.globalAlpha=1;
+  }else if(this.style==='particles_constellation'){
+   const vals=resample(values,48),points=vals.map((v,i)=>[pad+((i*.6180339)%1)*width,h*.1+((i*.4142135)%1)*h*.8,v]);
+   for(let i=0;i<points.length;i++){const[x,y,v]=points[i];if(v<.025)continue;g.globalAlpha=v;g.beginPath();g.arc(x,y,Math.max(1,c.thickness*.6+v*3),0,Math.PI*2);g.fill();for(let j=i+1;j<points.length;j++){const[xx,yy,vv]=points[j];if(vv>.1&&Math.hypot(xx-x,yy-y)<Math.min(w,h)*.25){g.globalAlpha=Math.min(v,vv)*.22;g.lineWidth=1;g.beginPath();g.moveTo(x,y);g.lineTo(xx,yy);g.stroke();}}}g.globalAlpha=1;
   }
   g.shadowBlur=0;g.globalAlpha=1;
  }
@@ -474,23 +633,26 @@ class Visualizer{
 const main=new Visualizer(document.getElementById('main'),selection),renderers=[main];
 function select(style){selection=style;main.style=style;document.getElementById('selected').textContent=STYLES[style];document.getElementById('choice-label').textContent=STYLES[style];document.querySelectorAll('.preset').forEach(el=>el.setAttribute('aria-pressed',String(el.dataset.style===style)));}
 if(gallery){
+ const group=id=>id.startsWith('particles')?'Partículas':id.startsWith('ring')||id.startsWith('orbit')?'Circulares':id.startsWith('scope')||id.startsWith('ribbon')?'Ondas':'Barras';
+ for(const category of ['Todos','Barras','Ondas','Circulares','Partículas']){const button=document.createElement('button');button.type='button';button.textContent=category;button.setAttribute('aria-pressed',String(category==='Todos'));button.addEventListener('click',()=>{document.querySelectorAll('#filters button').forEach(b=>b.setAttribute('aria-pressed',String(b===button)));document.querySelectorAll('.preset').forEach(el=>{el.hidden=category!=='Todos'&&group(el.dataset.style)!==category;});});document.getElementById('filters').append(button);}
  for(const [id,label]of Object.entries(STYLES)){const button=document.createElement('button');button.type='button';button.className='preset';button.dataset.style=id;button.setAttribute('aria-label',label);const canvas=document.createElement('canvas');canvas.setAttribute('aria-hidden','true');const caption=document.createElement('div');caption.className='preset-label';const name=document.createElement('span');name.textContent=label;const check=document.createElement('span');check.className='choice';check.textContent='Elegido';caption.append(name,check);button.append(canvas,caption);document.getElementById('grid').append(button);renderers.push(new Visualizer(canvas,id));button.addEventListener('click',()=>{clicked=true;select(id);});}
  document.getElementById('demo').addEventListener('change',e=>{demo=e.target.checked;});select(selection);
 }
-async function poll(){
- try{const response=await fetch('/state.json',{cache:'no-store'});if(!response.ok)throw Error('No disponible');const s=await response.json();packet=s;config=s.config;received=performance.now();document.documentElement.style.setProperty('--a',config.color_a);document.documentElement.style.setProperty('--b',config.color_b);
-  if(!gallery){main.style=STYLES[queryStyle]?queryStyle:config.style;document.body.style.background=config.background?config.background_color:'transparent';}
-  else if(!clicked&&!STYLES[queryStyle])select(config.style);
- }catch(e){packet.ready=false;}finally{setTimeout(poll,33);}
+function acceptState(s){packet=s;config=s.config;received=performance.now();document.documentElement.style.setProperty('--a',config.color_a);document.documentElement.style.setProperty('--b',config.color_b);
+ if(!gallery){main.style=STYLES[queryStyle]?queryStyle:config.style;document.body.style.background=config.background?config.background_color:'transparent';}
+ else if(!clicked&&!STYLES[queryStyle])select(config.style);
 }
-function demonstration(t){return{ready:true,bands:Array.from({length:64},(_,i)=>clamp((.3+.27*Math.sin(t*2.1-i*.32)+.15*Math.sin(t*.8+i*.65))*(1-i*.008))),wave:Array.from({length:256},(_,i)=>.2*Math.sin(i*.19+t)+.055*Math.sin(i*.57-t)),level:.4+.08*Math.sin(t*2)};}
-let previous=performance.now();
+async function poll(){try{const response=await fetch('/state.json',{cache:'no-store'});if(!response.ok)throw Error('No disponible');acceptState(await response.json());}catch(e){packet.ready=false;}finally{setTimeout(poll,8);}}
+function connect(){if(window.EventSource){const stream=new EventSource('/events');stream.onmessage=e=>{try{acceptState(JSON.parse(e.data));}catch(e){packet.ready=false;}};stream.onerror=()=>{packet.ready=false;};}else poll();}
+function demonstration(t){return{ready:true,bands:Array.from({length:128},(_,i)=>clamp((.3+.27*Math.sin(t*2.1-i*.32)+.15*Math.sin(t*.8+i*.65))*(1-i*.008))),wave:Array.from({length:1024},(_,i)=>.2*Math.sin(i*.19+t)+.055*Math.sin(i*.57-t)),level:.4+.08*Math.sin(t*2)};}
+let previous=performance.now(),lastPreview=0;
 function frame(now){const dt=Math.min(.05,(now-previous)/1000);previous=now;let data=gallery&&demo?demonstration(now/1000):{...packet,ready:packet.ready&&now-received<700};
- for(const renderer of renderers)renderer.draw(data,dt,config);
+ main.draw(data,dt,config);
+ if(gallery&&now-lastPreview>=1000/30){const previewDt=Math.min(.1,(now-lastPreview)/1000);lastPreview=now;for(const renderer of renderers.slice(1))renderer.draw(data,previewDt,config);}
  if(gallery){const signal=document.getElementById('signal');signal.classList.toggle('demo-on',demo);signal.textContent=demo?'Demostración · sin audio real':data.ready?`Audio de OBS · ${data.source||'MusicBee'}`:'Esperando audio de MusicBee';}
  requestAnimationFrame(frame);
 }
-poll();requestAnimationFrame(frame);
+connect();requestAnimationFrame(frame);
 </script></body></html>
 """
 
@@ -501,15 +663,42 @@ def _css_color(value):
 
 def _snapshot():
     with _lock:
-        config = {key: _cfg[key] for key in ('style', 'background', 'glow', 'intensity', 'smoothing', 'thickness', 'density')}
+        config = {key: _cfg[key] for key in ('style', 'background', 'glow', 'intensity', 'smoothing', 'attack_ms', 'release_ms', 'thickness', 'density')}
         config.update({key: _css_color(_cfg[key]) for key in ('color_a', 'color_b', 'background_color')})
         ready = bool(_audio_ok and _cfg['visualizer'] and time.monotonic() - _audio['stamp'] < .3)
         return {
             'ready': ready, 'source': _audio_source_name, 'error': _audio_error,
             'bands': list(_audio['bands']) if ready else [0.0] * BANDS,
             'wave': list(_audio['wave']) if ready else [0.0] * WAVE_POINTS,
-            'level': _audio['level'] if ready else 0.0, 'config': config,
+            'level': _audio['level'] if ready else 0.0, 'config': config, 'analysis': dict(_audio.get('analysis', {})),
         }
+
+
+def _stream_state(handler, snapshot):
+    """SSE: publicar cambios sin encadenar sondeos HTTP ni acumular cuadros antiguos."""
+    handler.send_response(200)
+    handler.send_header('Content-Type', 'text/event-stream; charset=utf-8')
+    handler.send_header('Cache-Control', 'no-cache')
+    handler.send_header('X-Accel-Buffering', 'no')
+    handler.end_headers()
+    stopped = getattr(handler.server, 'stream_stop', _stop)
+    sequence, next_frame = -1, 0.0
+    try:
+        while not _stop.is_set() and not stopped.is_set():
+            with _audio_updated:
+                _audio_updated.wait_for(lambda: _audio_seq != sequence or _stop.is_set() or stopped.is_set(), timeout=.2)
+                sequence = _audio_seq
+            if _stop.is_set() or stopped.is_set():
+                break
+            delay = next_frame - time.monotonic()
+            if delay > 0 and _stop.wait(delay):
+                break
+            payload = json.dumps(snapshot(), allow_nan=False, separators=(',', ':')).encode('utf-8')
+            handler.wfile.write(b'data: ' + payload + b'\n\n')
+            handler.wfile.flush()
+            next_frame = time.monotonic() + 1 / 120
+    except (BrokenPipeError, ConnectionResetError, OSError):
+        pass
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -518,6 +707,9 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = urlsplit(self.path).path.rstrip('/') or '/'
+        if path == '/events':
+            _stream_state(self, _snapshot)
+            return
         if path in ('/', '/overlay', '/compare'):
             code, mime, body = 200, 'text/html; charset=utf-8', OVERLAY_HTML.encode('utf-8')
         elif path == '/state.json':
@@ -538,6 +730,9 @@ class _Handler(BaseHTTPRequestHandler):
 def _stop_server():
     global _httpd, _httpd_port
     if _httpd is not None:
+        _httpd.stream_stop.set()
+        with _audio_updated:
+            _audio_updated.notify_all()
         _httpd.shutdown()
         _httpd.server_close()
     _httpd, _httpd_port = None, None
@@ -548,6 +743,7 @@ def _start_server(port):
     _stop_server()
     try:
         _httpd = ThreadingHTTPServer(('127.0.0.1', port), _Handler)
+        _httpd.stream_stop = threading.Event()
         _httpd_port = _httpd.server_port
         threading.Thread(target=_httpd.serve_forever, kwargs={'poll_interval': .1}, daemon=True).start()
     except OSError as e:
@@ -557,7 +753,7 @@ def _start_server(port):
 
 def script_description():
     return (
-        '<b>OBS Visualizers</b><br>Ocho visualizadores para el audio de MusicBee. '
+        '<b>OBS Visualizers</b><br>38 visualizadores para el audio de MusicBee. '
         'Por defecto comparten el audio de musicbee_nowplaying.py (puerto 8765). '
         'Carga ambos scripts para usar ese modo.<br>'
         'Fuente de navegador: <code>http://localhost:8766/</code>, 900×300, '
@@ -600,7 +796,7 @@ def _refresh_audio_sources(props, prop):
 
 
 def _mode_visibility(props, mode):
-    for name in ('audio_source', 'refresh_audio_sources', 'normalize'):
+    for name in ('audio_source', 'refresh_audio_sources', 'normalize', 'analysis_size'):
         obs.obs_property_set_visible(obs.obs_properties_get(props, name), mode == 'obs')
     obs.obs_property_set_visible(obs.obs_properties_get(props, 'musicbee_port'), mode == 'musicbee')
 
@@ -623,12 +819,17 @@ def script_properties():
     styles = obs.obs_properties_add_list(props, 'style', 'Estilo', obs.OBS_COMBO_TYPE_LIST, obs.OBS_COMBO_FORMAT_STRING)
     for value, label in PRESETS.items():
         obs.obs_property_list_add_string(styles, label, value)
+    fft = obs.obs_properties_add_list(props, 'analysis_size', 'Muestras de análisis (FFT)', obs.OBS_COMBO_TYPE_LIST, obs.OBS_COMBO_FORMAT_INT)
+    for size in (1024, 2048, 4096, 8192):
+        obs.obs_property_list_add_int(fft, str(size), size)
+    obs.obs_properties_add_float_slider(props, 'attack_ms', 'Tiempo de subida (ms, 0 = inmediato)', 0.0, 1000.0, 5.0)
+    obs.obs_properties_add_float_slider(props, 'release_ms', 'Tiempo de caída (ms, 0 = inmediato)', 0.0, 3000.0, 10.0)
     obs.obs_properties_add_color(props, 'color_a', 'Color principal')
     obs.obs_properties_add_color(props, 'color_b', 'Color secundario')
     obs.obs_properties_add_float_slider(props, 'intensity', 'Intensidad', .2, 2.5, .1)
-    obs.obs_properties_add_float_slider(props, 'smoothing', 'Suavizado', 0.0, 1.0, .05)
+    obs.obs_properties_add_float_slider(props, 'smoothing', 'Suavizado de la forma', 0.0, 1.0, .05)
     obs.obs_properties_add_float_slider(props, 'thickness', 'Grosor', .5, 12.0, .5)
-    obs.obs_properties_add_int_slider(props, 'density', 'Cantidad de bandas', 16, 96, 4)
+    obs.obs_properties_add_int_slider(props, 'density', 'Cantidad de bandas', 16, 256, 4)
     obs.obs_properties_add_bool(props, 'glow', 'Brillo suave')
     obs.obs_properties_add_bool(props, 'background', 'Fondo sólido (desactivado = transparente)')
     obs.obs_properties_add_color(props, 'background_color', 'Color de fondo')
@@ -640,6 +841,7 @@ def script_properties():
 
 
 def script_update(settings):
+    global _audio_seq
     with _lock:
         for key, value in _cfg.items():
             if isinstance(value, bool):
@@ -654,14 +856,18 @@ def script_update(settings):
             _cfg['style'] = 'ribbon'
         if _cfg['audio_mode'] not in ('musicbee', 'obs'):
             _cfg['audio_mode'] = 'musicbee'
-        for key, low, high in [('intensity', .2, 2.5), ('smoothing', 0.0, 1.0), ('thickness', .5, 12.0)]:
+        for key, low, high in [('intensity', .2, 2.5), ('smoothing', 0.0, 1.0), ('thickness', .5, 12.0), ('attack_ms', 0.0, 1000.0), ('release_ms', 0.0, 3000.0)]:
             value = _cfg[key]
             _cfg[key] = min(high, max(low, value)) if math.isfinite(value) else low
-        _cfg['density'] = min(96, max(16, _cfg['density']))
+        _cfg['density'] = min(256, max(16, _cfg['density']))
         for key, default in [('port', 8766), ('musicbee_port', 8765)]:
             if not 1024 <= _cfg[key] <= 65535:
                 _cfg[key] = default
+        if _cfg['analysis_size'] not in (1024, 2048, 4096, 8192):
+            _cfg['analysis_size'] = 4096
         port = _cfg['port']
+        _audio_seq += 1
+        _audio_updated.notify_all()
     if _audio_thread is not None and port != _httpd_port:
         _start_server(port)
 

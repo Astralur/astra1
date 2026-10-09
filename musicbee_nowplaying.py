@@ -46,10 +46,12 @@ except Exception as e:
 
 POLL_SECONDS = 1.0
 MAX_COVER_TRIES = 6
-BANDS = 48
-WAVE_POINTS = 256
+BANDS = 128
+WAVE_POINTS = 1024
 
 _lock = threading.Lock()
+_audio_updated = threading.Condition(_lock)
+_audio_seq = 0
 _stop = threading.Event()
 _thread = None
 _audio_thread = None
@@ -66,8 +68,10 @@ _cfg = {
     "port": 8765,
     "hide_paused": False,
     "visualizer": True,
+    "analysis_size": 4096,
     "audio_source": "",
     "capture_muted": True,
+    "wave_smoothing": .2, "wave_attack_ms": 18.0, "wave_release_ms": 140.0,
 }
 
 _state = {
@@ -83,6 +87,7 @@ _audio_ok = False
 _wave = [0.0] * WAVE_POINTS
 _level = 0.0
 _audio_stamp = 0.0
+_analysis_data = {}
 _audio_error = None
 _audio_source_name = ""
 _last_applied = None
@@ -245,15 +250,18 @@ def _worker():
 # -------------------------------------- fuente de audio OBS / espectro (FFT) ---
 
 class _SpectrumProcessor:
-    """AGC RMS solo para las ondas: nivel objetivo, límite de ganancia y puerta de silencio."""
-    def __init__(self, np, rate=44100, n=2048):
+    """PCM continuo, FFT solapada y normalización exclusiva del visualizador."""
+    def __init__(self, np, rate=44100, n=4096):
         self.np, self.rate, self.n = np, rate, n
+        self.hop = 512
         self.win = np.hanning(n).astype(np.float32)[:, None]
         self.buf = np.zeros((n, 2), dtype=np.float32)
         self.gain = None
         self.wave = [0.0] * WAVE_POINTS
         self.level = 0.0
-        edges = np.geomspace(40, min(14000, rate * .49), BANDS + 1)
+        self.processed_frames = 0
+        self.fft_windows = 0
+        edges = np.geomspace(40, min(20000, rate * .49), BANDS + 1)
         freqs = np.fft.rfftfreq(n, 1.0 / rate)
         self.idx = [np.flatnonzero((freqs >= edges[i]) & (freqs < edges[i + 1])) for i in range(BANDS)]
         for i, bins in enumerate(self.idx):
@@ -270,13 +278,15 @@ class _SpectrumProcessor:
     def process(self, data, normalize=True):
         np = self.np
         if not len(data):
+            self.reset()
             return [0.0] * BANDS
         data = np.nan_to_num(np.asarray(data, dtype=np.float32), nan=0, posinf=0, neginf=0)
+        self.processed_frames += len(data)
         if self.buf.shape[1] != data.shape[1]:
             self.buf = np.zeros((self.n, data.shape[1]), dtype=np.float32)
             self.gain = None
         rms = float(np.sqrt(np.mean(data * data)))
-        if rms <= .0001:  # ~-80 dBFS: no convertir ruido o silencio en ondas.
+        if rms <= .0001:
             self.reset()
             return [0.0] * BANDS
         peak = float(np.max(np.abs(data)))
@@ -288,31 +298,33 @@ class _SpectrumProcessor:
         else:
             tau = .05 if desired < self.gain else .6
             self.gain += (desired - self.gain) * (1 - math.exp(-len(data) / self.rate / tau))
-        # Limitar inmediatamente los picos, subir suavemente en pasajes más bajos.
         if normalize:
             self.gain = min(self.gain, .98 / peak)
-        samples = data[-self.n:] * self.gain
-        count = len(samples)
-        self.buf[:-count] = self.buf[count:]
-        self.buf[-count:] = samples
+        samples = data * self.gain
         self.level = min(1.0, float(np.sqrt(np.mean(samples * samples))) * 4)
-        # Osciloscopio real: canal con más energía, ventana alineada al cruce por cero.
+        mag = np.zeros(self.n // 2 + 1, dtype=np.float32)
+        # Analizar TODOS los bloques recibidos, no únicamente la cola de la señal.
+        # Se conservan los picos entre ventanas del mismo lote para no perder ataques.
+        for offset in range(0, len(samples), self.hop):
+            block = samples[offset:offset + self.hop]
+            count = len(block)
+            self.buf[:-count] = self.buf[count:]
+            self.buf[-count:] = block
+            fft = np.fft.rfft(self.buf * self.win, axis=0)
+            current = np.sqrt(np.mean(np.abs(fft) ** 2, axis=1)) / (self.n / 4)
+            np.maximum(mag, current, out=mag)
+            self.fft_windows += 1
+        # Enviar 1024 muestras reales, sin interpolarlas desde una onda pequeña.
         channel = int(np.argmax(np.mean(self.buf * self.buf, axis=0)))
         signal = self.buf[:, channel]
-        length = min(768, self.n)
-        limit = self.n - length
-        crossings = np.flatnonzero((signal[:limit + 1] <= 0) & (signal[1:limit + 2] > 0))
+        limit = self.n - WAVE_POINTS
+        crossings = np.flatnonzero((signal[:limit + 1] <= 0) & (signal[1:limit + 2] > 0)) if limit else []
         start = int(crossings[-1]) if len(crossings) else limit
-        window = signal[start:start + length]
-        self.wave = np.clip(np.interp(np.linspace(0, length - 1, WAVE_POINTS),
-                                     np.arange(length), window), -1, 1).round(4).tolist()
-        # Energía de ambos canales: una señal estéreo en contrafase no desaparece.
-        fft = np.fft.rfft(self.buf * self.win, axis=0)
-        mag = np.sqrt(np.mean(np.abs(fft) ** 2, axis=1)) / (self.n / 4)
+        self.wave = np.clip(signal[start:start + WAVE_POINTS], -1, 1).round(5).tolist()
         out = []
         for i, bins in enumerate(self.idx):
             db = 20 * np.log10(float(mag[bins].max()) + 1e-9)
-            out.append(round(min(1.0, max(0.0, (db + 72) / 52 + self.tilt[i])), 3))
+            out.append(round(min(1.0, max(0.0, (db + 72) / 52 + self.tilt[i])), 4))
         return out
 
 
@@ -378,7 +390,8 @@ class _ObsAudioTap:
         self.active = False
         self.registered = False
         self.error = None
-        self.packets = queue.Queue(maxsize=4)
+        self.packets = queue.Queue(maxsize=32)
+        self.dropped_packets = 0
         self.callback = _AUDIO_CALLBACK(self._capture)
         self.rate, self.channels = api.audio_info()
         try:
@@ -398,7 +411,7 @@ class _ObsAudioTap:
 
     def _capture(self, _, source, audio, muted):
         # No ejecutar FFT ni llamar a OBS desde su hilo de audio. Copiar antes
-        # de que OBS reutilice los buffers; la cola descarta audio antiguo.
+        # de que OBS reutilice los buffers; descartar solo si se llena la cola.
         if not self.active or source != self.source or not audio:
             return
         try:
@@ -414,6 +427,7 @@ class _ObsAudioTap:
             except queue.Full:
                 try:
                     self.packets.get_nowait()
+                    self.dropped_packets += 1
                 except queue.Empty:
                     pass
                 try:
@@ -424,16 +438,21 @@ class _ObsAudioTap:
             self.error = str(e)
 
     def read(self, np):
-        planes = self.packets.get(timeout=.05)
-        # Usar el paquete más reciente para mantener baja la latencia.
+        pending = [self.packets.get(timeout=.025)]
         while True:
             try:
-                planes = self.packets.get_nowait()
+                pending.append(self.packets.get_nowait())
             except queue.Empty:
                 break
-        if planes is None:
-            return None  # Fuente silenciada.
-        return np.column_stack([np.frombuffer(p, dtype=np.float32) for p in planes])
+        # El silencio explícito marca una discontinuidad. Conservar toda la señal
+        # posterior a ella, en lugar de descartar cada paquete salvo el último.
+        if pending[-1] is None:
+            return None
+        last_mute = max((i for i, planes in enumerate(pending) if planes is None), default=-1)
+        chunks = [np.column_stack([np.frombuffer(p, dtype=np.float32) for p in planes])
+                  for planes in pending[last_mute + 1:]]
+        return np.concatenate(chunks, axis=0)
+
 
     def close(self):
         self.active = False
@@ -445,12 +464,15 @@ class _ObsAudioTap:
             self.source = None
 
 
-def _publish_audio(bars, ready=False, source='', error=None, wave=None, level=0.0):
-    global _bars, _audio_ok, _audio_source_name, _audio_error, _wave, _level, _audio_stamp
-    with _lock:
+def _publish_audio(bars, ready=False, source='', error=None, wave=None, level=0.0, analysis=None):
+    global _bars, _audio_ok, _audio_source_name, _audio_error, _wave, _level, _audio_stamp, _audio_seq, _analysis_data
+    with _audio_updated:
         _bars, _audio_ok, _audio_source_name, _audio_error = bars, ready, source, error
         _wave = list(wave) if wave is not None else [0.0] * WAVE_POINTS
         _level, _audio_stamp = level, time.monotonic()
+        _analysis_data = dict(analysis or {})
+        _audio_seq += 1
+        _audio_updated.notify_all()
 
 
 def _audio_worker():
@@ -472,6 +494,7 @@ def _audio_worker():
             try:
                 with _lock:
                     enabled, requested, capture_muted = _cfg['visualizer'], _cfg['audio_source'], _cfg['capture_muted']
+                    analysis_size = _cfg['analysis_size']
                 if not enabled or not requested:
                     if tap:
                         tap.close()
@@ -484,9 +507,11 @@ def _audio_worker():
                     tap = None
                 if tap is None:
                     tap = _ObsAudioTap(api, requested, capture_muted=capture_muted)
-                    processor = _SpectrumProcessor(np, rate=tap.rate)
+                    processor = _SpectrumProcessor(np, rate=tap.rate, n=analysis_size)
                     last_packet = inspected = time.monotonic()
                     _publish_audio(zero, source=requested)
+                if processor.n != analysis_size:
+                    processor = _SpectrumProcessor(np, rate=tap.rate, n=analysis_size)
                 now = time.monotonic()
                 if now - inspected >= .5:
                     if api.obs_source_removed(tap.source):
@@ -510,7 +535,10 @@ def _audio_worker():
                     bars = zero
                 else:
                     bars = processor.process(data)
-                _publish_audio(bars, True, requested, wave=processor.wave, level=processor.level)
+                _publish_audio(bars, True, requested, wave=processor.wave, level=processor.level,
+                               analysis={"sample_rate": tap.rate, "fft_size": processor.n,
+                                         "processed_frames": processor.processed_frames,
+                                         "fft_windows": processor.fft_windows, "dropped_packets": tap.dropped_packets})
                 last_packet = time.monotonic()
                 last_error = None
             except Exception as e:
@@ -614,7 +642,7 @@ canvas{position:absolute;bottom:0;left:0;width:100%;height:44px;opacity:.12;poin
 </div>
 <script>
 const $ = id => document.getElementById(id);
-const N = 48;
+const N = 128;
 let rev = -1, lastKey = null, playing = false;
 let snap = {pos: 0, dur: 0, playing: false, t0: performance.now()};
 
@@ -734,16 +762,18 @@ setInterval(() => {
 
 /* ---------- waveform ---------- */
 let target = new Array(N).fill(0), cur = new Array(N).fill(0), real = false, busy = false;
+let response = {smoothing:.2,attack_ms:18,release_ms:140};
 
 async function pollBars(){
   if (busy) return; busy = true;
   try{
     const s = await (await fetch('/spectrum.json', {cache: 'no-store'})).json();
+    response = s;
     real = s.real && s.enabled;
     target = real ? s.bars : new Array(N).fill(0);
   }catch(e){ real = false; target = new Array(N).fill(0); } finally { busy = false; }
 }
-setInterval(pollBars, 33);
+if(window.EventSource){const stream=new EventSource('/audio-events');stream.onmessage=e=>{try{const s=JSON.parse(e.data);response=s;real=s.real&&s.enabled;target=real?s.bars:new Array(N).fill(0);}catch(e){real=false;target.fill(0);}};stream.onerror=()=>{real=false;target.fill(0);};}else setInterval(pollBars,16);
 
 const cv = $('wave'), g = cv.getContext('2d');
 let W = 0, H = 0;
@@ -760,11 +790,12 @@ function frame(now){
   const src = real && playing ? target : new Array(N).fill(0);
   for (let i=0;i<N;i++){
     const t = src[i] || 0;
-    const k = t > cur[i] ? 1-Math.exp(-dt*22) : 1-Math.exp(-dt*5.5);   // sube rapido, cae suave
+    const ms = t > cur[i] ? response.attack_ms : response.release_ms;
+    const k = ms > 0 ? 1-Math.exp(-dt*1000/ms) : 1;   // sube rapido, cae suave
     cur[i] += (t - cur[i]) * k;
   }
   // suavizado entre bandas vecinas
-  const sm = cur.map((v,i) => (cur[Math.max(0,i-1)] + 2*v + cur[Math.min(N-1,i+1)]) / 4);
+  const sm = cur.map((v,i) => v*(1-response.smoothing) + response.smoothing*(cur[Math.max(0,i-1)] + 2*v + cur[Math.min(N-1,i+1)]) / 4);
   // simetrica: graves en el centro
   const pts = new Array(N*2);
   for (let i=0;i<N;i++){ pts[N-1-i] = sm[i]; pts[N+i] = sm[i]; }
@@ -808,6 +839,46 @@ poll(); setInterval(poll, 1000);
 """
 
 
+def _audio_snapshot():
+    with _lock:
+        return {
+            "bars": list(_bars), "real": bool(_audio_ok and _cfg["visualizer"] and time.monotonic() - _audio_stamp < .3),
+            "enabled": _cfg["visualizer"], "source": _audio_source_name,
+            "wave": list(_wave), "level": _level,
+            "age": max(0.0, time.monotonic() - _audio_stamp),
+            "error": _audio_error, "analysis": dict(_analysis_data),
+            "smoothing": _cfg["wave_smoothing"],
+            "attack_ms": _cfg["wave_attack_ms"], "release_ms": _cfg["wave_release_ms"],
+        }
+
+
+def _stream_state(handler, snapshot):
+    """SSE: publicar cambios sin encadenar sondeos HTTP ni acumular cuadros antiguos."""
+    handler.send_response(200)
+    handler.send_header('Content-Type', 'text/event-stream; charset=utf-8')
+    handler.send_header('Cache-Control', 'no-cache')
+    handler.send_header('X-Accel-Buffering', 'no')
+    handler.end_headers()
+    stopped = getattr(handler.server, 'stream_stop', _stop)
+    sequence, next_frame = -1, 0.0
+    try:
+        while not _stop.is_set() and not stopped.is_set():
+            with _audio_updated:
+                _audio_updated.wait_for(lambda: _audio_seq != sequence or _stop.is_set() or stopped.is_set(), timeout=.2)
+                sequence = _audio_seq
+            if _stop.is_set() or stopped.is_set():
+                break
+            delay = next_frame - time.monotonic()
+            if delay > 0 and _stop.wait(delay):
+                break
+            payload = json.dumps(snapshot(), allow_nan=False, separators=(',', ':')).encode('utf-8')
+            handler.wfile.write(b'data: ' + payload + b'\n\n')
+            handler.wfile.flush()
+            next_frame = time.monotonic() + 1 / 120
+    except (BrokenPipeError, ConnectionResetError, OSError):
+        pass
+
+
 class _Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
@@ -823,6 +894,9 @@ class _Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = self.path.split("?")[0]
         try:
+            if path == "/audio-events":
+                _stream_state(self, _audio_snapshot)
+                return
             if path in ("/", "/overlay", "/overlay.html"):
                 self._send(200, "text/html; charset=utf-8", OVERLAY_HTML.encode("utf-8"))
             elif path == "/now.json":
@@ -838,14 +912,7 @@ class _Handler(BaseHTTPRequestHandler):
                     }
                 self._send(200, "application/json", json.dumps(payload).encode("utf-8"))
             elif path == "/spectrum.json":
-                with _lock:
-                    payload = {
-                        "bars": list(_bars), "real": bool(_audio_ok and _cfg["visualizer"]),
-                        "enabled": _cfg["visualizer"], "source": _audio_source_name,
-                        "wave": list(_wave), "level": _level,
-                        "age": max(0.0, time.monotonic() - _audio_stamp),
-                        "error": _audio_error,
-                    }
+                payload = _audio_snapshot()
                 self._send(200, "application/json", json.dumps(payload).encode("utf-8"))
             elif path == "/cover":
                 with _lock:
@@ -869,13 +936,17 @@ def _start_server(port):
         _httpd = None
         obs.script_log(obs.LOG_WARNING, f"MusicBee NowPlaying: no se pudo abrir el puerto {port}: {e}")
         return
-    _httpd_port = port
+    _httpd.stream_stop = threading.Event()
+    _httpd_port = _httpd.server_port
     threading.Thread(target=_httpd.serve_forever, daemon=True).start()
 
 
 def _stop_server():
     global _httpd, _httpd_port
     if _httpd is not None:
+        _httpd.stream_stop.set()
+        with _audio_updated:
+            _audio_updated.notify_all()
         _httpd.shutdown()
         _httpd.server_close()
     _httpd, _httpd_port = None, None
@@ -927,6 +998,8 @@ def script_defaults(settings):
     for key, value in _cfg.items():
         if isinstance(value, bool):
             obs.obs_data_set_default_bool(settings, key, value)
+        elif isinstance(value, float):
+            obs.obs_data_set_default_double(settings, key, value)
         elif isinstance(value, int):
             obs.obs_data_set_default_int(settings, key, value)
         else:
@@ -959,6 +1032,12 @@ def script_properties():
     obs.obs_properties_add_bool(props, "hide_paused", "Ocultar overlay en pausa")
     obs.obs_properties_add_bool(props, "visualizer", "Ondas de MusicBee (nivel normalizado)")
     obs.obs_properties_add_bool(props, "capture_muted", "Capturar aunque la fuente esté silenciada en OBS")
+    fft = obs.obs_properties_add_list(props, "analysis_size", "Muestras de análisis (FFT)", obs.OBS_COMBO_TYPE_LIST, obs.OBS_COMBO_FORMAT_INT)
+    for size in (1024, 2048, 4096, 8192):
+        obs.obs_property_list_add_int(fft, str(size), size)
+    obs.obs_properties_add_float_slider(props, "wave_smoothing", "Suavizado de la forma", 0, 1, .05)
+    obs.obs_properties_add_float_slider(props, "wave_attack_ms", "Tiempo de subida (ms, 0 = inmediato)", 0, 1000, 5)
+    obs.obs_properties_add_float_slider(props, "wave_release_ms", "Tiempo de caída (ms, 0 = inmediato)", 0, 3000, 10)
     audio = obs.obs_properties_add_list(
         props, "audio_source", "Fuente de audio OBS para las ondas",
         obs.OBS_COMBO_TYPE_LIST, obs.OBS_COMBO_FORMAT_STRING,
@@ -995,18 +1074,27 @@ def script_properties():
 
 
 def script_update(settings):
-    global _last_applied
+    global _last_applied, _audio_seq
     with _lock:
         for key, value in _cfg.items():
             if isinstance(value, bool):
                 _cfg[key] = obs.obs_data_get_bool(settings, key)
+            elif isinstance(value, float):
+                _cfg[key] = obs.obs_data_get_double(settings, key)
             elif isinstance(value, int):
                 _cfg[key] = obs.obs_data_get_int(settings, key)
             else:
                 _cfg[key] = obs.obs_data_get_string(settings, key)
+        if _cfg["analysis_size"] not in (1024, 2048, 4096, 8192):
+            _cfg["analysis_size"] = 4096
+        for key, low, high in [("wave_smoothing", 0, 1), ("wave_attack_ms", 0, 1000), ("wave_release_ms", 0, 3000)]:
+            value = _cfg[key]
+            _cfg[key] = min(high, max(low, value)) if math.isfinite(value) else low
         port = _cfg["port"]
         # forzar que se vuelva a leer la carátula con el nuevo filtro
         _state.update(key=None, cover=None, tries=0)
+        _audio_seq += 1
+        _audio_updated.notify_all()
     _last_applied = None
     if _thread is not None and port != _httpd_port:
         _start_server(port)

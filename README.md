@@ -50,6 +50,19 @@ La forma de las ondas sigue cambiando con la música.
 Esta ganancia solo se aplica a una **copia** de las muestras que calcula el
 visualizador: **no cambia el volumen audible de MusicBee ni el de la fuente de OBS**.
 
+## Detalle y rapidez de las ondas
+
+El análisis usa 128 bandas y comparte 1.024 muestras reales de onda con el script
+de visualizadores. Procesa los paquetes completos con FFT solapadas y envía los
+cambios por una conexión continua. **Muestras de análisis (FFT)** permite elegir
+entre 1.024 y 8.192 (4.096 por defecto).
+
+Ajusta **Suavizado de la forma**, **Tiempo de subida** y **Tiempo de caída** en las
+propiedades del script. El suavizado modifica el detalle; los tiempos modifican
+la respuesta. Menos milisegundos = más rapidez; 0 = inmediato. Los controles del
+overlay y del script de visualizadores son independientes. Consulta los ejemplos
+[y las diferencias entre tamaños FFT](VISUALIZERS.md#más-muestras-y-reacción-ajustable).
+
 ## Comprobaciones
 
 ```console
@@ -63,7 +76,7 @@ requiere ejecutar el script dentro de OBS en Windows 10/11.
 
 ## Más estilos
 
-El script separado [obs_visualizers.py](obs_visualizers.py) ofrece ocho estilos y
+El script separado [obs_visualizers.py](obs_visualizers.py) ofrece **38 presets** y
 una galería para compararlos. Por defecto comparte este mismo audio de MusicBee,
 incluyendo la captura con la fuente silenciada. Consulta
 [las instrucciones de visualizadores](VISUALIZERS.md).

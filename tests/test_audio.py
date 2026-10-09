@@ -181,14 +181,54 @@ class AudioTests(unittest.TestCase):
         self.assertEqual(api.events, [('release', 1)])
         self.assertFalse(api.callbacks)
 
-    def test_queue_keeps_latest_audio_and_stays_bounded(self):
+    def test_queue_preserves_every_packet_in_order(self):
         api = self.fake_api()
         tap = self.module._ObsAudioTap(api, 'MusicBee')
         for i in range(20):
             api.emit(1, self.tone * (i / 100))
-        self.assertLessEqual(tap.packets.qsize(), 4)
-        np.testing.assert_array_equal(tap.read(np), self.tone * .19)
+        expected = np.concatenate([self.tone * (i / 100) for i in range(20)])
+        np.testing.assert_array_equal(tap.read(np), expected)
+        self.assertEqual(tap.dropped_packets, 0)
         tap.close()
+
+    def test_overloaded_queue_is_bounded_and_reports_lost_packets(self):
+        api = self.fake_api()
+        tap = self.module._ObsAudioTap(api, 'MusicBee')
+        for i in range(40):
+            api.emit(1, self.tone * (i / 100))
+        self.assertEqual(tap.packets.qsize(), 32)
+        self.assertEqual(tap.dropped_packets, 8)
+        expected = np.concatenate([self.tone * (i / 100) for i in range(8, 40)])
+        np.testing.assert_array_equal(tap.read(np), expected)
+        tap.close()
+
+    def test_muting_discards_only_audio_before_the_discontinuity(self):
+        api = self.fake_api()
+        tap = self.module._ObsAudioTap(api, 'MusicBee')
+        api.emit(1, self.tone * .1)
+        api.emit(1, self.tone * .2, muted=True)
+        api.emit(1, self.tone * .3)
+        api.emit(1, self.tone * .4)
+        np.testing.assert_array_equal(tap.read(np), np.concatenate([self.tone * .3, self.tone * .4]))
+        tap.close()
+
+    def test_fft_catches_attack_even_when_end_of_batch_is_silent(self):
+        processor = self.module._SpectrumProcessor(np)
+        batch = np.concatenate([np.tile(self.tone, (4, 1)) * .1, np.zeros((8192, 2), dtype=np.float32)])
+        bars = processor.process(batch, normalize=False)
+        self.assertEqual(processor.processed_frames, len(batch))
+        self.assertEqual(processor.fft_windows, len(batch) // processor.hop)
+        self.assertEqual(float(np.abs(processor.buf).max()), 0.0)
+        self.assertGreater(max(bars), .7)
+
+    def test_fft_sizes_keep_actual_wave_samples_without_interpolation(self):
+        data = np.column_stack([np.linspace(.01, .2, 9000, dtype=np.float32)] * 2)
+        for size in (1024, 2048, 4096, 8192):
+            with self.subTest(size=size):
+                processor = self.module._SpectrumProcessor(np, n=size)
+                self.assertEqual(len(processor.process(data, normalize=False)), 128)
+                self.assertEqual(processor.processed_frames, len(data))
+                np.testing.assert_allclose(processor.wave, data[-1024:, 0], atol=.000006)
 
     def test_mono_and_surround_sources_can_be_normalized(self):
         for channels in [1, 6, 8]:
